@@ -205,7 +205,7 @@ fn consume_agent_mode_marker() -> bool {
     true
 }
 
-fn show_startup_error(product_name: &str, lang: Lang, failure: &state::UiError) {
+pub fn show_startup_error(product_name: &str, lang: Lang, failure: &state::UiError) {
     let full_error = failure.copy_text(lang);
     let mut description = full_error.clone();
     match state::persist_error_report("startup_error.txt", &full_error) {
@@ -311,17 +311,22 @@ impl GuiApp {
             #[cfg(all(feature = "capture", target_os = "windows"))]
             capture_tab: capture_tab_state,
         };
-        if agent_mode {
-            app.start_agent_manager();
+        if agent_mode
+            || (cfg!(target_os = "windows")
+                && app.app_config.config.navigation.active_game == Game::Genshin)
+        {
+            app.start_agent_manager(agent_mode);
         }
         app
     }
 
-    fn start_agent_manager(&mut self) {
-        self.app_config
-            .config
-            .navigation
-            .select_tab(ToolTab::Manager);
+    fn start_agent_manager(&mut self, show_manager: bool) {
+        if show_manager {
+            self.app_config
+                .config
+                .navigation
+                .select_tab(ToolTab::Manager);
+        }
         if let Err(error) = self.app_config.persist_now() {
             log::warn!(
                 target: yas::lang::LOCALIZED_LOG_TARGET,
@@ -333,8 +338,8 @@ impl GuiApp {
         if let Err(error) = privilege::ensure_admin_for_action() {
             let failure = state::UiError::from_anyhow(
                 state::UiText::new(
-                    "Agent 模式需要管理员权限；请通过 GGScanner Agent 启动任务重新打开程序。",
-                    "Agent mode requires administrator privileges; restart through the GGScanner Agent task.",
+                    "程序需要管理员权限，请重新启动并允许授权。",
+                    "Administrator privileges are required; reopen the app and allow elevation.",
                 ),
                 &error,
             );
@@ -443,6 +448,14 @@ impl eframe::App for GuiApp {
         let is_capture_busy = self.capture_tab.is_busy();
         #[cfg(not(all(feature = "capture", target_os = "windows")))]
         let is_capture_busy = false;
+        let server_busy = is_server_running
+            && (self.state.local_scans.lock().unwrap().is_none()
+                || self
+                    .server_handle
+                    .as_ref()
+                    .is_some_and(TaskHandle::is_stopping)
+                || self.state.server_job.lock().unwrap().state
+                    == genshin_scanner::manager::models::JobPhase::Running);
         let genshin_busy = is_scan_running || is_server_running || is_capture_busy;
         let star_rail_scan_running = self.star_rail.scan_running();
         let star_rail_manager_running = self.star_rail.manager_running();
@@ -611,6 +624,13 @@ impl eframe::App for GuiApp {
                             && !restart_required
                             && !owns_running_task
                             && (game_task_busy || update_in_progress)
+                            && !(active_game == Game::Genshin
+                                && active_tab == ToolTab::Scanner
+                                && !server_busy
+                                && !is_capture_busy
+                                && !star_rail_busy
+                                && !data_refreshing
+                                && !update_in_progress)
                         {
                             let running_tab = if is_server_running || star_rail_manager_running {
                                 ToolTab::Manager
@@ -643,7 +663,7 @@ impl eframe::App for GuiApp {
                             (Game::Genshin, ToolTab::Scanner, layout::Pane::Settings) => {
                                 ui.add_enabled_ui(
                                     !restart_required
-                                        && !(is_server_running
+                                        && !(server_busy
                                             || is_capture_busy
                                             || star_rail_busy
                                             || update_in_progress)
@@ -663,7 +683,7 @@ impl eframe::App for GuiApp {
                                     ui,
                                     &mut self.state,
                                     &mut self.scan_handle,
-                                    is_server_running
+                                    server_busy
                                         || is_capture_busy
                                         || star_rail_busy
                                         || update_in_progress,

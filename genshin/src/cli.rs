@@ -2114,6 +2114,36 @@ pub fn run_server_core_observed(
     status_fn: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     native_job: Option<std::sync::Arc<std::sync::Mutex<crate::manager::models::JobState>>>,
 ) -> Result<()> {
+    run_server_core_with_local_scans(
+        user_config,
+        server_port,
+        ocr,
+        enabled,
+        shutdown,
+        stop_on_all_matched,
+        filter_involved_sets,
+        dump_images,
+        dump_job_data,
+        status_fn,
+        native_job,
+        None,
+    )
+}
+
+pub fn run_server_core_with_local_scans(
+    user_config: &GoodUserConfig,
+    server_port: u16,
+    ocr: &OcrEngineArgs,
+    enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop_on_all_matched: bool,
+    filter_involved_sets: bool,
+    dump_images: bool,
+    dump_job_data: bool,
+    status_fn: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    native_job: Option<std::sync::Arc<std::sync::Mutex<crate::manager::models::JobState>>>,
+    local_scans: Option<crate::server::LocalScanSlot>,
+) -> Result<()> {
     init_rayon_pool();
     crate::scanner::common::annotator::init(dump_images);
     crate::scanner::common::pixel_profile::set_hdr_mode(user_config.hdr_mode);
@@ -2195,7 +2225,7 @@ pub fn run_server_core_observed(
         }))
     };
 
-    crate::server::run_server_observed(
+    crate::server::run_server_with_local_scans(
         server_port,
         init_executor,
         enabled,
@@ -2203,6 +2233,7 @@ pub fn run_server_core_observed(
         dump_job_data,
         status_fn,
         native_job,
+        local_scans,
     )
 }
 

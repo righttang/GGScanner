@@ -8,9 +8,11 @@
 
 同一套 `GGScannerOCR.exe` 与 `GGScanner.exe` 同时服务两款游戏。《原神》数据继续导出为兼容现有工具的 [GOOD v3](https://frzyc.github.io/genshin-optimizer/#/doc)；《星穹铁道》扫描与抓包导出为 [HSR-Scanner v4](docs/HSR_EXPORT.md)（Fribbels / Reliquary 互通格式，并扩展成就与开拓者性别/命途）。
 
-[![Build](https://github.com/Anyrainel/GGScanner/actions/workflows/rust.yml/badge.svg)](https://github.com/Anyrainel/GGScanner/actions)
+[![Build](https://github.com/righttang/GGScanner/actions/workflows/rust.yml/badge.svg)](https://github.com/righttang/GGScanner/actions)
 
 </div>
+
+本仓库是 [Anyrainel/GGScanner](https://github.com/Anyrainel/GGScanner) 的 righttang 修改版，保留上游功能与开源致谢。主要改动包括 Windows HDR 扫描修复、游戏点击及延迟 OCR 回馈、启动即提供本机服务、扫描期间查询进度与停止，以及一次授权后的本机启停入口。使用方法见 [Windows 本机控制说明](docs/WINDOWS_LOCAL_CONTROL.md) 和 [API 文档](docs/MANAGER_API.md)。
 
 ## 功能
 
@@ -34,7 +36,7 @@
 
 旧的 `GOODCapture.exe` 与 `GOODScanner.exe` 下载名称会在新名称首次发布后保留一个月，供已安装的旧版程序自动更新。过渡期结束后，无法自动更新的用户可从网站重新下载。详见[更名发布流程](docs/RENAME_RELEASE.md)。
 
-请从 [Releases](https://github.com/Anyrainel/GGScanner/releases) 页面下载。**无需也不应寻找单独的 HSR 可执行文件。**
+请从本修改版的 [Releases](https://github.com/righttang/GGScanner/releases) 页面下载；尚未发布的构建可在 [Actions](https://github.com/righttang/GGScanner/actions/workflows/rust.yml) 查看。**无需也不应寻找单独的 HSR 可执行文件。**
 
 ### 成就导出语义
 

@@ -36,6 +36,20 @@ lazy_static::lazy_static! {
     static ref LEVEL_REGEX: Regex = Regex::new(r"\+?\s*(\d+)").unwrap();
 }
 
+fn parse_artifact_level(text: &str) -> Option<i32> {
+    LEVEL_REGEX
+        .captures(text)
+        .and_then(|c| c[1].parse::<i32>().ok())
+        .filter(|&v| v <= 20)
+}
+
+fn is_elixir_banner_color(rgb: [u8; 3], hdr: bool) -> bool {
+    // HDR tone mapping compresses purple to (255, 234, 255) on the live
+    // Windows capture, while the normal panel is (255, 255, 255).
+    let blue_green_gap = if hdr { 12 } else { 40 };
+    u16::from(rgb[2]) > 230 && u16::from(rgb[2]) > u16::from(rgb[1]) + blue_green_gap
+}
+
 /// Crop fraction for number-only OCR retry: percent stats need more left trimming
 /// to skip the stat name, flat stats need less.
 fn crop_frac_for_stat(is_percent: bool) -> f64 {
@@ -397,10 +411,11 @@ impl GoodArtifactScanner {
             scaler,
         );
         let positions: [(f64, f64); 3] = [(1510.0, 423.0), (1520.0, 423.0), (1530.0, 423.0)];
+        let hdr = crate::scanner::common::pixel_profile::is_hdr_mode();
         let mut purple_count = 0;
         for &(bx, by) in &positions {
             let rgb = frame.pixel(scaler, bx, by);
-            let is_purple = (rgb[2] as u16) > 230 && (rgb[2] as u16) > (rgb[1] as u16) + 40;
+            let is_purple = is_elixir_banner_color(rgb, hdr);
             if is_purple {
                 purple_count += 1;
             }
@@ -513,11 +528,8 @@ impl GoodArtifactScanner {
             let level_text =
                 Self::ocr_image_region_shifted(ocr, image, ocr_regions.level, 0.0, scaler)
                     .unwrap_or_default();
-            let quick_level = LEVEL_REGEX
-                .captures(&level_text)
-                .and_then(|c| c[1].parse::<i32>().ok())
-                .unwrap_or(0);
-            if quick_level == 0 {
+            let quick_level = parse_artifact_level(&level_text);
+            if quick_level == Some(0) {
                 log_debug!(
                     "[artifact] idx={} {}星 lv0 < 最低{}星，停止",
                     "[artifact] idx={} {}* lv0 < min {}*, stopping",
@@ -536,12 +548,14 @@ impl GoodArtifactScanner {
                 "[artifact] idx={} {}* lv{} < min {}*, skipping (not lv0)",
                 item_index,
                 rarity,
-                quick_level,
+                quick_level.map_or_else(|| "?".to_string(), |v| v.to_string()),
                 config.min_rarity
             );
             annotator::finalize_skip(&format!(
                 "{}* lv{} below min {}*",
-                rarity, quick_level, config.min_rarity
+                rarity,
+                quick_level.map_or_else(|| "?".to_string(), |v| v.to_string()),
+                config.min_rarity
             ));
             return Ok(ArtifactScanResult::Skip);
         }
@@ -629,17 +643,10 @@ impl GoodArtifactScanner {
         let y_shift = if elixir_crafted { ELIXIR_SHIFT } else { 0.0 };
 
         // 4. Level — dual-engine OCR, collect both for solver
-        let parse_level = |text: &str| -> i32 {
-            LEVEL_REGEX
-                .captures(text)
-                .and_then(|c| c[1].parse::<i32>().ok())
-                .filter(|&v| v <= 20)
-                .unwrap_or(-1)
-        };
         let level_text1 =
             Self::ocr_image_region_shifted(ocr, image, ocr_regions.level, y_shift, scaler)
                 .unwrap_or_default();
-        let lv1 = parse_level(&level_text1);
+        let lv1 = parse_artifact_level(&level_text1);
 
         let level_text2 = if same_model(ocr, substat_ocr) {
             level_text1.clone()
@@ -647,26 +654,37 @@ impl GoodArtifactScanner {
             Self::ocr_image_region_shifted(substat_ocr, image, ocr_regions.level, y_shift, scaler)
                 .unwrap_or_default()
         };
-        let lv2 = parse_level(&level_text2);
+        let lv2 = parse_artifact_level(&level_text2);
 
-        let level = if lv1 >= 0 && lv2 >= 0 {
-            lv1.max(lv2)
-        } else if lv1 >= 0 {
-            lv1
-        } else if lv2 >= 0 {
-            lv2
-        } else {
-            0
-        };
+        let level =
+            match lv1.into_iter().chain(lv2).max() {
+                Some(level) => level,
+                None => {
+                    annotator::finalize_error(None, "cannot identify artifact level");
+                    if config.continue_on_failure {
+                        log_warn!(
+                        "[artifact] idx={} 等级无法识别，跳过：引擎1=「{}」，引擎2=「{}」",
+                        "[artifact] idx={} level unreadable, skipping: engine1='{}', engine2='{}'",
+                        item_index, level_text1, level_text2
+                    );
+                        return Ok(ArtifactScanResult::Skip);
+                    }
+                    bail!(
+                        "无法识别圣遗物等级 / Cannot identify artifact level: {:?}, {:?}",
+                        level_text1,
+                        level_text2
+                    );
+                },
+            };
         if lv1 != lv2 {
             log_debug!(
                 "[artifact] idx={} 等级双引擎OCR: 引擎1=「{}」→{} 引擎2=「{}」→{} → {}",
                 "[artifact] idx={} level dual-OCR: engine1=「{}」→{} engine2=「{}」→{} → {}",
                 item_index,
                 level_text1.trim(),
-                lv1,
+                lv1.unwrap_or(-1),
                 level_text2.trim(),
-                lv2,
+                lv2.unwrap_or(-1),
                 level
             );
         }
@@ -681,7 +699,11 @@ impl GoodArtifactScanner {
             let raw_display = if lv1 == lv2 {
                 format!("+{}", level)
             } else {
-                format!("+{} | +{}", lv1, lv2)
+                format!(
+                    "{} | {}",
+                    lv1.map_or_else(|| "?".to_string(), |v| format!("+{v}")),
+                    lv2.map_or_else(|| "?".to_string(), |v| format!("+{v}"))
+                )
             };
             annotator::record_ocr("level", level_rect, &raw_display);
             annotator::set_final("level", &format!("+{}", level));
@@ -725,16 +747,8 @@ impl GoodArtifactScanner {
         // Phase 3: If solver fails, retry with progressively cropped substat widths.
         // Phase 4: If still unsolved, fall back to heuristic merge.
         let mut solver_candidates: Vec<Vec<OcrCandidate>> = Vec::new();
-        let mut level_candidates: Vec<i32> = Vec::new();
-        if lv1 >= 0 {
-            level_candidates.push(lv1);
-        }
-        if lv2 >= 0 && lv2 != lv1 {
-            level_candidates.push(lv2);
-        }
-        if level_candidates.is_empty() {
-            level_candidates.push(0);
-        }
+        let mut level_candidates: Vec<i32> = lv1.into_iter().chain(lv2).collect();
+        level_candidates.dedup();
 
         // Maximum possible substat lines for this rarity and level.
         // 5-star: always 4 (init 3+1 unactivated or init 4).
@@ -1383,37 +1397,6 @@ impl GoodArtifactScanner {
             },
         };
 
-        // Reject lower-rarity versions of higher-rarity sets, and all 3-star
-        // artifacts globally. In Genshin, 5-star sets have 4-star variants and
-        // 4-star sets have 3-star variants — the mappings file stores each
-        // set's canonical (max) rarity.
-        if rarity == 3 {
-            log_debug!(
-                "[artifact] idx={} 忽略3星圣遗物",
-                "[artifact] idx={} ignoring 3* artifact",
-                item_index
-            );
-            annotator::finalize_skip("3* artifact");
-            return Ok(ArtifactScanResult::Skip);
-        }
-        if let Some(&set_max_rarity) = mappings.artifact_set_max_rarity.get(&set_key) {
-            if rarity < set_max_rarity {
-                log_debug!(
-                    "[artifact] idx={} 忽略{}星 {} 变体（套装最高{}星）",
-                    "[artifact] idx={} ignoring {}* {} variant (set max {}*)",
-                    item_index,
-                    rarity,
-                    set_key,
-                    set_max_rarity
-                );
-                annotator::finalize_skip(&format!(
-                    "{}* variant of {}* set",
-                    rarity, set_max_rarity
-                ));
-                return Ok(ArtifactScanResult::Skip);
-            }
-        }
-
         // 8. Equipped character
         // Try v4 first, fall back to v5 if no match (v4 dict lacks some rare chars like 魈/Xiao)
         let equip_text = Self::ocr_image_region(substat_ocr, image, ocr_regions.equip, scaler)?;
@@ -1499,11 +1482,7 @@ impl GoodArtifactScanner {
         };
         let text = Self::ocr_image_region_shifted(ocr, image, regions.level, y_shift, scaler)
             .unwrap_or_default();
-        LEVEL_REGEX
-            .captures(&text)
-            .and_then(|c| c[1].parse::<i32>().ok())
-            .filter(|&v| v <= 20)
-            .unwrap_or(-1)
+        parse_artifact_level(&text).unwrap_or(-1)
     }
 
     /// 从游戏截图中识别单个圣遗物（同步调用）。
@@ -2027,12 +2006,7 @@ impl GoodArtifactScanner {
         let level_text =
             Self::ocr_image_region_shifted(ocr, image, self.ocr_regions.level, y_shift, scaler)
                 .unwrap_or_default();
-        let level = {
-            LEVEL_REGEX
-                .captures(&level_text)
-                .and_then(|c| c[1].parse::<i32>().ok())
-                .unwrap_or(0)
-        };
+        let level = parse_artifact_level(&level_text).unwrap_or(-1);
         fields.push(DebugOcrField {
             field_name: "level".into(),
             raw_text: level_text,
@@ -2202,6 +2176,66 @@ mod tests {
             dump_images: false,
             continue_on_failure: false,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hdr_elixir_banner_is_distinct_from_the_white_panel() {
+        assert!(is_elixir_banner_color([255, 234, 255], true));
+        assert!(!is_elixir_banner_color([255, 255, 255], true));
+        assert!(!is_elixir_banner_color([255, 253, 255], true));
+        assert!(!is_elixir_banner_color([236, 229, 216], true));
+        assert!(is_elixir_banner_color([220, 192, 255], false));
+        assert!(!is_elixir_banner_color([236, 229, 216], false));
+    }
+
+    #[test]
+    fn unreadable_low_rarity_level_does_not_end_the_scan() {
+        let mut image = make_1080p_image();
+        paint_rarity_stars(&mut image, 3);
+        let level_ocr = FakeOcr::new(vec![""]);
+        let general_ocr = FakeOcr::new(vec![]);
+        let result = GoodArtifactScanner::scan_single_artifact(
+            &level_ocr,
+            &general_ocr,
+            &CaptureFrame::full(image),
+            &make_1080p_scaler(),
+            &ArtifactOcrRegions::new(),
+            &make_test_mappings(),
+            &default_config(),
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(result, ArtifactScanResult::Skip));
+    }
+
+    #[test]
+    fn unreadable_level_is_never_exported_as_zero() {
+        for continue_on_failure in [false, true] {
+            let mut image = make_1080p_image();
+            paint_rarity_stars(&mut image, 5);
+            paint_elixir_banner(&mut image, false);
+            let level_ocr = FakeOcr::new(vec![""]);
+            let general_ocr = FakeOcr::new(vec!["生之花", "生命值", ""]);
+            let mut config = default_config();
+            config.continue_on_failure = continue_on_failure;
+            let result = GoodArtifactScanner::scan_single_artifact(
+                &level_ocr,
+                &general_ocr,
+                &CaptureFrame::full(image),
+                &make_1080p_scaler(),
+                &ArtifactOcrRegions::new(),
+                &make_test_mappings(),
+                &config,
+                0,
+                None,
+            );
+            if continue_on_failure {
+                assert!(matches!(result.unwrap(), ArtifactScanResult::Skip));
+            } else {
+                assert!(result.is_err());
+            }
         }
     }
 

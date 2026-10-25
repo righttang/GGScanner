@@ -21,6 +21,11 @@ use anyhow::{anyhow, Result};
 use tiny_http::{Header, Method, Response, Server};
 use yas::{log_error, log_info, log_warn};
 
+mod game_input;
+mod local_scan;
+pub use game_input::{ClickFeedback, ClickRequest, OcrReading, OcrRegion};
+pub use local_scan::{record_scan_count, record_scan_phase, LocalScanClient, LocalScanSlot};
+
 use crate::cli::{GoodUserConfig, ScanCoreConfig};
 use crate::manager::models::*;
 use crate::manager::orchestrator::ArtifactManager;
@@ -127,8 +132,19 @@ enum JobRequest {
     Scan(ScanRequest),
 }
 
+enum ExecutionRequest {
+    Job(JobRequest),
+    Input(game_input::InputTask),
+    LocalScan(local_scan::LocalScanTask),
+    Shutdown,
+}
+
 /// Abstraction over game interaction for testability.
 pub trait ManageExecutor {
+    fn execute_click(&mut self, _request: &ClickRequest) -> ClickFeedback {
+        ClickFeedback::failed("Game input is not supported by this executor")
+    }
+
     /// Recheck task data even when the game/OCR executor is reused by the server.
     fn prepare_task(&mut self) -> Result<()> {
         Ok(())
@@ -175,6 +191,10 @@ pub struct GameExecutor {
 }
 
 impl ManageExecutor for GameExecutor {
+    fn execute_click(&mut self, request: &ClickRequest) -> ClickFeedback {
+        game_input::execute_game_click(self, request)
+    }
+
     fn prepare_task(&mut self) -> Result<()> {
         let mappings = crate::scanner::common::mappings::MappingManager::new(
             &self.user_config.to_overrides(),
@@ -725,6 +745,31 @@ pub fn run_server_observed<F>(
 where
     F: FnMut() -> anyhow::Result<Box<dyn ManageExecutor>>,
 {
+    run_server_with_local_scans(
+        port,
+        init_executor,
+        enabled,
+        shutdown,
+        dump_job_data,
+        status_fn,
+        native_job,
+        None,
+    )
+}
+
+pub fn run_server_with_local_scans<F>(
+    port: u16,
+    init_executor: F,
+    enabled: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    dump_job_data: bool,
+    status_fn: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    native_job: Option<Arc<Mutex<JobState>>>,
+    local_scans: Option<LocalScanSlot>,
+) -> Result<()>
+where
+    F: FnMut() -> anyhow::Result<Box<dyn ManageExecutor>>,
+{
     let addr = format!("127.0.0.1:{}", port);
     let server = Server::http(&addr).map_err(|e| contextualize_server_bind_error(port, e))?;
     let server = Arc::new(server);
@@ -755,7 +800,18 @@ where
         Arc::new(Mutex::new(ScanDataCache::empty()));
 
     // Channel for submitting jobs from HTTP thread to execution thread
-    let (job_tx, job_rx) = mpsc::channel::<(String, JobRequest)>();
+    let (job_tx, job_rx) = mpsc::channel::<(String, ExecutionRequest)>();
+
+    let active_cancel = Arc::new(Mutex::new(None));
+    if let Some(slot) = &local_scans {
+        *slot.lock().unwrap() = Some(LocalScanClient {
+            tx: job_tx.clone(),
+            state: job_state.clone(),
+            active: active_cancel.clone(),
+            shutdown: shutdown.clone(),
+        });
+    }
+    let http_cancel = active_cancel.clone();
 
     // Clone shared refs for the HTTP thread
     let http_state = job_state.clone();
@@ -764,6 +820,9 @@ where
     let http_weapon_cache = weapon_cache.clone();
     let http_artifact_cache = artifact_cache.clone();
     let http_achievement_cache = achievement_cache.clone();
+
+    let input_receipts = Arc::new(Mutex::new(game_input::InputReceipts::default()));
+    let http_input_receipts = input_receipts.clone();
 
     // Clone job_tx for the HTTP thread before moving the original
     let http_job_tx = job_tx.clone();
@@ -781,6 +840,7 @@ where
         );
         shutdown_server.unblock();
         // Drop the original sender so job_rx.recv() unblocks once the HTTP thread also exits
+        let _ = job_tx.send((String::new(), ExecutionRequest::Shutdown));
         drop(job_tx);
     });
 
@@ -813,6 +873,17 @@ where
             };
             let cors_ref = cors_origin.as_deref();
 
+            if url.starts_with("/input/") && !game_input::local_origin_only(cors_ref) {
+                respond_error(
+                    request,
+                    403,
+                    "游戏输入仅允许本机客户端。",
+                    "Game input is available to local clients only.",
+                    None,
+                );
+                continue;
+            }
+
             // CORS preflight (always respond for allowed origins)
             if method == Method::Options {
                 let mut resp = Response::empty(204);
@@ -832,6 +903,19 @@ where
             }
 
             match (method, url.as_str()) {
+                (Method::Post, "/input/click") => {
+                    game_input::handle_click(
+                        request,
+                        &http_enabled,
+                        &http_state,
+                        &http_job_tx,
+                        &http_input_receipts,
+                        cors_ref,
+                    );
+                },
+                (Method::Get, url) if url.starts_with("/input/result?") => {
+                    game_input::handle_result(request, url, &http_input_receipts, cors_ref);
+                },
                 (Method::Post, "/manage") => {
                     handle_manage(
                         request,
@@ -863,6 +947,10 @@ where
                         cors_ref,
                         dump_job_data,
                     );
+                },
+
+                (Method::Post, "/stop") => {
+                    local_scan::handle_stop(request, &http_state, &http_cancel, cors_ref);
                 },
 
                 // Lightweight poll — no result payload.
@@ -1040,6 +1128,127 @@ where
             );
             break;
         }
+        let request = match request {
+            ExecutionRequest::Shutdown => break,
+            ExecutionRequest::Job(request) => request,
+            ExecutionRequest::LocalScan(task) => {
+                // GUI scans run on this same execution thread. The listener
+                // remains responsive and no second OCR/input worker can race it.
+                executor = None;
+                for (selected, cache_id) in [
+                    (task.request.characters, 0),
+                    (task.request.weapons, 1),
+                    (task.request.artifacts, 2),
+                    (task.request.achievements, 3),
+                ] {
+                    if selected {
+                        match cache_id {
+                            0 => character_cache
+                                .lock()
+                                .unwrap()
+                                .mark_incomplete(job_id.clone()),
+                            1 => weapon_cache.lock().unwrap().mark_incomplete(job_id.clone()),
+                            2 => artifact_cache
+                                .lock()
+                                .unwrap()
+                                .mark_incomplete(job_id.clone()),
+                            _ => achievement_cache
+                                .lock()
+                                .unwrap()
+                                .mark_incomplete(job_id.clone()),
+                        }
+                    }
+                }
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task.run))
+                    .unwrap_or_else(|_| Err(anyhow!("the local scan panicked")));
+                if let Ok(path) = &result {
+                    if !std::path::Path::new(path)
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("good_export_partial_"))
+                    {
+                        if let Ok(export) = std::fs::read(path)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|bytes| {
+                                serde_json::from_slice::<GoodExport>(&bytes).map_err(Into::into)
+                            })
+                        {
+                            if let Some(data) = export.characters {
+                                character_cache.lock().unwrap().set(job_id.clone(), data);
+                            }
+                            if let Some(data) = export.weapons {
+                                weapon_cache.lock().unwrap().set(job_id.clone(), data);
+                            }
+                            if let Some(data) = export.artifacts {
+                                artifact_cache.lock().unwrap().set(job_id.clone(), data);
+                            }
+                            if let Some(data) = export.achievements {
+                                achievement_cache.lock().unwrap().set(job_id.clone(), data);
+                            }
+                        }
+                    }
+                }
+                let instruction = match &result {
+                    Ok(_) if !task.token.is_cancelled() => {
+                        InstructionResult::outcome("scan", InstructionStatus::Success)
+                    },
+                    _ if task.token.is_cancelled() => {
+                        InstructionResult::outcome("scan", InstructionStatus::Aborted)
+                    },
+                    Err(error) => InstructionResult::failure(
+                        "scan",
+                        InstructionStatus::UiError,
+                        "扫描未能完成。",
+                        "The scan could not finish.",
+                        Some(error),
+                    ),
+                    Ok(_) => unreachable!(),
+                };
+                let results = vec![instruction];
+                let summary = ManageSummary::from_results(&results);
+                {
+                    let mut state = job_state.lock().unwrap();
+                    *state = state.finished(job_id.clone(), ManageResult { results, summary });
+                }
+                let _ = task.reply.send(result);
+                continue;
+            },
+            ExecutionRequest::Input(task) => {
+                // Input shares the execution thread and admission lock with
+                // scans and managers, but does not pay the batch startup delay.
+                character_cache.lock().unwrap().invalidate();
+                weapon_cache.lock().unwrap().invalidate();
+                artifact_cache.lock().unwrap().invalidate();
+                achievement_cache.lock().unwrap().invalidate();
+                let feedback = game_input::execute_task(&task, &mut executor, &mut init_executor);
+                input_receipts
+                    .lock()
+                    .unwrap()
+                    .finish(&job_id, feedback.clone());
+                let instruction = if feedback.clicked == Some(true) {
+                    InstructionResult::outcome(&job_id, InstructionStatus::Success)
+                } else {
+                    let source = anyhow!(feedback
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Input outcome unknown".into()));
+                    InstructionResult::failure(
+                        &job_id,
+                        InstructionStatus::UiError,
+                        "点击未能确认完成，请先检查游戏状态。",
+                        "Click completion could not be confirmed; observe the game first.",
+                        Some(&source),
+                    )
+                };
+                let results = vec![instruction];
+                let summary = ManageSummary::from_results(&results);
+                {
+                    let mut state = job_state.lock().unwrap();
+                    *state = state.finished(job_id.clone(), ManageResult { results, summary });
+                }
+                let _ = task.reply.send(feedback);
+                continue;
+            },
+        };
         log_info!(
             "[job {}] 收到任务，1秒后开始执行",
             "[job {}] Job received, starting in 1 second",
@@ -1053,6 +1262,8 @@ where
         // 1-second delay: let the client see the "running" state update
         // before the game window is focused and takes over the screen.
         yas::utils::sleep(1000);
+
+        let _ = local_scan::cancel_token(&active_cancel, &job_id);
 
         // Lazy init: create executor if we don't have one yet. On failure we
         // do NOT poison the server — the next job gets a fresh attempt, since
@@ -1161,22 +1372,7 @@ where
         let scan_state = job_state.clone();
         let status_fn_scan = status_fn.clone();
         let scan_progress_fn = move |completed: usize, total: usize, _id: &str, phase: &str| {
-            if let Ok(mut state) = scan_state.lock() {
-                if let Some(ref mut sp) = state.scan_progress {
-                    let slot = match phase {
-                        "characters" => sp.characters.as_mut(),
-                        "weapons" => sp.weapons.as_mut(),
-                        "artifacts" => sp.artifacts.as_mut(),
-                        "achievements" => sp.achievements.as_mut(),
-                        _ => None,
-                    };
-                    if let Some(pp) = slot {
-                        pp.completed = completed;
-                        pp.total = total;
-                        pp.state = PhaseState::Running;
-                    }
-                }
-            }
+            record_scan_count(&scan_state, completed, total, phase);
             if let Some(ref f) = status_fn_scan {
                 let (zh, en) = match phase {
                     "characters" => ("扫描角色", "Scanning characters"),
@@ -1201,30 +1397,9 @@ where
 
         let phases_state = job_state.clone();
         let scan_phase_fn = move |key: &str, event| {
-            use crate::scanner::common::progress::ScanPhaseEvent;
-            if let Ok(mut state) = phases_state.lock() {
-                if let Some(scan) = &mut state.scan_progress {
-                    let slot = match key {
-                        "characters" => &mut scan.characters,
-                        "weapons" => &mut scan.weapons,
-                        "artifacts" => &mut scan.artifacts,
-                        "achievements" => &mut scan.achievements,
-                        _ => return,
-                    };
-                    if let Some(phase) = slot {
-                        phase.state = match event {
-                            ScanPhaseEvent::Started => PhaseState::Running,
-                            ScanPhaseEvent::Complete(count) => {
-                                phase.completed = count;
-                                PhaseState::Complete
-                            },
-                            ScanPhaseEvent::Interrupted => PhaseState::Aborted,
-                        };
-                    }
-                }
-            }
+            record_scan_phase(&phases_state, key, event);
         };
-        let cancel_token = yas::cancel::CancelToken::new();
+        let cancel_token = local_scan::cancel_token(&active_cancel, &job_id);
 
         // Dispatch: manage/equip use ManageResult; scan builds its own ManageResult summary.
         enum JobOutcome {
@@ -1646,7 +1821,7 @@ fn handle_manage(
     mut request: tiny_http::Request,
     enabled: &AtomicBool,
     state: &Arc<Mutex<JobState>>,
-    job_tx: &mpsc::Sender<(String, JobRequest)>,
+    job_tx: &mpsc::Sender<(String, ExecutionRequest)>,
     cors_origin: Option<&str>,
     dump_job_data: bool,
 ) {
@@ -1795,6 +1970,18 @@ fn handle_manage(
     // Set state to Running
     {
         let mut s = state.lock().unwrap();
+        // GUI submissions share this admission lock with HTTP requests.
+        if s.state == JobPhase::Running {
+            drop(s);
+            respond_error(
+                request,
+                409,
+                "另一个任务正在运行。",
+                "Another job is already running.",
+                cors_origin,
+            );
+            return;
+        }
         *s = JobState::running(job_id.clone(), total);
         s.ui.kind = Some(crate::manager::models::JobKind::Manage {
             lock: manage_request.lock.len(),
@@ -1803,7 +1990,10 @@ fn handle_manage(
     }
 
     // Send to execution thread
-    if let Err(e) = job_tx.send((job_id.clone(), JobRequest::Manage(manage_request))) {
+    if let Err(e) = job_tx.send((
+        job_id.clone(),
+        ExecutionRequest::Job(JobRequest::Manage(manage_request)),
+    )) {
         let mut s = state.lock().unwrap();
         *s = JobState::idle();
         respond_error_with_diagnostic(
@@ -1827,7 +2017,7 @@ fn handle_equip(
     mut request: tiny_http::Request,
     enabled: &AtomicBool,
     state: &Arc<Mutex<JobState>>,
-    job_tx: &mpsc::Sender<(String, JobRequest)>,
+    job_tx: &mpsc::Sender<(String, ExecutionRequest)>,
     cors_origin: Option<&str>,
     dump_job_data: bool,
 ) {
@@ -1962,11 +2152,26 @@ fn handle_equip(
 
     {
         let mut s = state.lock().unwrap();
+        // GUI submissions share this admission lock with HTTP requests.
+        if s.state == JobPhase::Running {
+            drop(s);
+            respond_error(
+                request,
+                409,
+                "另一个任务正在运行。",
+                "Another job is already running.",
+                cors_origin,
+            );
+            return;
+        }
         *s = JobState::running(job_id.clone(), total);
         s.ui.kind = Some(crate::manager::models::JobKind::Equip);
     }
 
-    if let Err(e) = job_tx.send((job_id.clone(), JobRequest::Equip(equip_request))) {
+    if let Err(e) = job_tx.send((
+        job_id.clone(),
+        ExecutionRequest::Job(JobRequest::Equip(equip_request)),
+    )) {
         let mut s = state.lock().unwrap();
         *s = JobState::idle();
         respond_error_with_diagnostic(
@@ -1989,7 +2194,7 @@ fn handle_scan(
     mut request: tiny_http::Request,
     enabled: &AtomicBool,
     state: &Arc<Mutex<JobState>>,
-    job_tx: &mpsc::Sender<(String, JobRequest)>,
+    job_tx: &mpsc::Sender<(String, ExecutionRequest)>,
     cors_origin: Option<&str>,
     dump_job_data: bool,
 ) {
@@ -2139,10 +2344,25 @@ fn handle_scan(
 
     {
         let mut s = state.lock().unwrap();
+        // GUI submissions share this admission lock with HTTP requests.
+        if s.state == JobPhase::Running {
+            drop(s);
+            respond_error(
+                request,
+                409,
+                "另一个任务正在运行。",
+                "Another job is already running.",
+                cors_origin,
+            );
+            return;
+        }
         *s = JobState::running_scan(job_id.clone(), scan_chars, scan_wpns, scan_arts, scan_achs);
     }
 
-    if let Err(e) = job_tx.send((job_id.clone(), JobRequest::Scan(scan_request))) {
+    if let Err(e) = job_tx.send((
+        job_id.clone(),
+        ExecutionRequest::Job(JobRequest::Scan(scan_request)),
+    )) {
         let mut s = state.lock().unwrap();
         *s = JobState::idle();
         respond_error_with_diagnostic(

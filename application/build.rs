@@ -49,5 +49,13 @@ fn main() {
         res.set("OriginalFilename", original_filename);
 
         res.compile().unwrap();
+        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+            // GNU ld can discard winres's resource-only archive because it
+            // exports no referenced symbol. Link the generated COFF object
+            // directly so the administrator manifest and icon really ship.
+            let resource =
+                std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("resource.o");
+            println!("cargo:rustc-link-arg-bins={}", resource.display());
+        }
     }
 }

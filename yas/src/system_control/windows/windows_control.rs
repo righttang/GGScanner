@@ -89,6 +89,15 @@ impl WindowsSystemControl {
         self.enigo.key_click(key);
         anyhow::Ok(())
     }
+
+    /// Replace the contents of an already focused in-game text field.
+    pub fn replace_text(&mut self, text: &str) -> anyhow::Result<()> {
+        self.enigo.key_down(Key::Control);
+        self.enigo.key_click(Key::Layout('a'));
+        self.enigo.key_up(Key::Control);
+        self.enigo.key_sequence(text);
+        anyhow::Ok(())
+    }
 }
 
 impl crate::system_control::gesture::DragDriver for WindowsSystemControl {

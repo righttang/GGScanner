@@ -73,10 +73,29 @@ fn init_cli() {
 }
 
 pub fn main() {
-    // GUI automation is opt-in and still uses the same GUI/server paths as
-    // ordinary launches. The dedicated launch flag is used by the constrained
-    // local GGScanner agent tasks; all other arguments retain CLI behavior.
+    // Ordinary GUI startup opens the local service. Agent launches also select
+    // its manager page; scanner CLI arguments retain their existing behavior.
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(windows)]
+    if (args.len() == 1 || args.len() == 2) && args[0] == "--install-local-launcher" {
+        if let Err(error) =
+            good_tools_app::local_launcher::install(args.get(1).map(std::path::Path::new))
+        {
+            good_tools_app::gui::show_startup_error(
+                "GGScannerOCR",
+                good_tools_app::gui::state::Lang::Zh,
+                &good_tools_app::gui::state::UiError::from_anyhow(
+                    good_tools_app::gui::state::UiText::new(
+                        "本机启动授权未完成。",
+                        "Local launcher setup did not finish.",
+                    ),
+                    &error,
+                ),
+            );
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.is_empty() {
         good_tools_app::gui::run_gui();
         return;

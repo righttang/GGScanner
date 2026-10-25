@@ -705,6 +705,7 @@ pub struct AppState {
     pub server_enabled: Arc<AtomicBool>,
     pub server_status: Arc<Mutex<TaskStatus>>,
     pub server_job: Arc<Mutex<genshin_scanner::manager::models::JobState>>,
+    pub local_scans: genshin_scanner::server::LocalScanSlot,
     // --- Per-tab log buffers ---
     pub scanner_log_lines: Arc<LogStore>,
     pub manager_log_lines: Arc<LogStore>,
@@ -746,6 +747,7 @@ impl AppState {
             config_dirty_since: None,
             scan_status: Arc::new(Mutex::new(TaskStatus::Idle)),
             scan_progress: Arc::new(Mutex::new(super::task_progress::TaskProgress::default())),
+            local_scans: Arc::new(Mutex::new(None)),
             server_enabled: Arc::new(AtomicBool::new(true)),
             server_status: Arc::new(Mutex::new(TaskStatus::Idle)),
             server_job: Arc::new(Mutex::new(

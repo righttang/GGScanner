@@ -19,6 +19,17 @@ pub fn set_thread_log_source(src: LogSource) {
     LOG_SOURCE_OVERRIDE.with(|c| c.set(Some(src)));
 }
 
+pub fn with_thread_log_source<R>(source: LogSource, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<LogSource>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOG_SOURCE_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(LOG_SOURCE_OVERRIDE.with(|c| c.replace(Some(source))));
+    run()
+}
+
 static GENSHIN_VERBOSE: AtomicBool = AtomicBool::new(false);
 static HSR_VERBOSE: AtomicBool = AtomicBool::new(false);
 

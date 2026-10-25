@@ -30,6 +30,10 @@ The server binds to `127.0.0.1` only (not `0.0.0.0`), so it is not reachable fro
 
 Request body size limit: 5 MB.
 
+The `/input/*` endpoints are more restrictive: only native local clients with
+no Origin, or loopback browser origins, are accepted. GGArtifact and other
+remote browser origins cannot send game input. Click bodies are limited to 16 KiB.
+
 ## Error responses
 
 Every response with an error body keeps the same schema:
@@ -54,7 +58,108 @@ JSON decoding, the diagnostic text is unchanged, including any `" / "` text it
 contains. HTTP statuses and the single-string `error` schema are the same in both
 languages.
 
+## Service lifecycle and GUI scans
+
+Windows Genshin GUI startup automatically starts the configured loopback service.
+The listener remains available during both GUI and API scans. GUI scans enter
+its same execution queue, publish their job ID and category counts through
+`GET /status`, and can be stopped through either the GUI button or `POST /stop`.
+A competing game operation returns 409; health/status/result requests continue
+responding. GUI scans retain their existing partial-export behavior. An aborted
+category is not published as a complete API inventory.
+
+### `POST /stop`
+
+Body: `{"jobId":"the-current-job-id"}` (maximum 4 KiB).
+Returns `{"jobId":"...","stopRequested":true}` after signalling cancellation.
+Poll the same job until terminal before starting another. Repeating this for the
+completed current job returns `stopRequested:false`; an unknown or old job ID
+returns 404 and never stops a newer job. An already submitted individual click
+returns 409 because input cannot be undone. Stopping a job leaves the service
+listening.
+
+For an explicitly authorized local installation, launching the Windows binary
+once with `--install-local-launcher` registers an on-demand Task Scheduler task
+for the current interactive user at highest privileges. It has no automatic
+trigger, no stored password, and a fixed action pointing to that same executable.
+`data/local-launcher.json` records its name; later `schtasks /Run /TN <name>`
+launches it without another elevation prompt. The generated `GGScannerOCR.lnk`
+uses that task as well. Administrator approval is required only for registration;
+Windows elevation is not disabled.
+
 ## Endpoints
+
+### `POST /input/click` (click, wait, then OCR)
+
+Coordinates and OCR rectangles are actual pixels relative to the game client
+area, matching a game-window screenshot. They are not desktop coordinates or
+the scanner's scaled 1920×1080 navigation coordinates.
+
+The same serialized endpoint optionally accepts `key` for fixed game navigation:
+`menu`, `partySetup`, `inventory`, `character`, `map`, `interact`, or `confirm`.
+For example, `{"x":0,"y":0,"key":"partySetup","delayMs":1500}` opens party
+configuration without a mouse click. Arbitrary keys and system shortcuts are
+rejected. On Windows, `text` instead clicks the supplied coordinate and replaces
+the focused game text field; it accepts 1–64 printable characters and rejects
+control characters. `key` and `text` are mutually exclusive. Coordinates remain
+required and validated. Focus, busy-state, cancellation, delayed OCR and request
+ID replay checks apply to every input. The existing `feedback.clicked` field
+reports whether the requested input was submitted, including key/text actions.
+
+```json
+{
+  "requestId": "enhance-step-001",
+  "x": 1650,
+  "y": 1010,
+  "delayMs": 800,
+  "ocr": [
+    {"name":"level","x":1330,"y":425,"width":85,"height":35},
+    {"name":"button","x":1540,"y":980,"width":260,"height":50}
+  ]
+}
+```
+
+`delayMs` defaults to 500 and accepts 0–5000. `ocr` is optional and supports up to
+16 rectangles; use one text line per rectangle. All rectangles and the click are
+validated against the current game window before input. The selected game must
+be in the foreground, and holding the right mouse button cancels the click.
+
+The request shares the scanner/manager execution thread. A running scan, equip,
+manage, or input task rejects a new click with 409. A paused manager returns 503.
+Input invalidates scan caches because it can change in-game data.
+
+The normal response waits for the click, requested delay, and OCR:
+
+```json
+{
+  "jobId":"enhance-step-001",
+  "state":"completed",
+  "feedback":{
+    "clicked":true,
+    "width":1920,
+    "height":1080,
+    "ocr":[{"name":"level","x":1330,"y":425,"width":85,"height":35,"text":"+4"}]
+  }
+}
+```
+
+Always inspect `feedback.clicked`, `feedback.error`, and each OCR reading's
+optional `error`. A completed response uses HTTP 200 even if game validation
+prevented input (`clicked:false`). `clicked:null` means input may have executed;
+observe the game before taking another action. An OCR failure after a successful
+click retains `clicked:true`, so clients must not repeat the click to retry OCR.
+
+Use a unique `requestId` for every intended click. Retrying the same ID and body
+returns the original receipt without another click; changing the body under
+the same ID returns 409. IDs use 1–128 letters, digits, underscores, or hyphens.
+The last 64 receipts are retained in memory until server restart. If omitted,
+the server generates a job ID, and automatic POST retries are unsafe.
+
+If work takes more than 15 seconds, POST returns HTTP 202 with `jobId` and
+`state:"running"`. Poll `GET /input/result?jobId=<id>` for the delayed feedback;
+do not submit a replacement click. Pending results return 202; completed results
+return 200; unknown or expired IDs return 404. `GET /status` also reflects the
+input task's busy/completed lifecycle.
 
 ### `GET /health`
 

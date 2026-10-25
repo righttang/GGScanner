@@ -24,7 +24,7 @@ use yas::{log_debug, log_info, log_warn};
 pub const ASSET_SCANNER: &str = "GGScannerOCR.exe";
 /// Asset filename for the merged packet capture + OCR/manager binary.
 pub const ASSET_CAPTURE: &str = "GGScanner.exe";
-pub const RELEASES_URL: &str = "https://github.com/Anyrainel/GGScanner/releases/latest";
+pub const RELEASES_URL: &str = "https://github.com/righttang/GGScanner/releases/latest";
 
 /// Download mirror prefixes, tried in order.  Empty string = direct GitHub.
 const DOWNLOAD_MIRRORS: &[&str] = &[
@@ -33,10 +33,8 @@ const DOWNLOAD_MIRRORS: &[&str] = &[
     "", // direct GitHub
 ];
 
-/// Try the future repository first, while supporting the transition release
-/// before the repository is renamed. Old installed updaters still need release
-/// assets published under GOODScanner/GOODCapture aliases after the rename.
-const RELEASE_REPOSITORIES: &[&str] = &["Anyrainel/GGScanner", "Anyrainel/GOODScanner"];
+/// This fork must not replace itself with an upstream build that lacks its fixes.
+const RELEASE_REPOSITORIES: &[&str] = &["righttang/GGScanner"];
 
 /// Minimum plausible exe size (1 MB).  The real binary is 20+ MB;
 /// anything smaller is almost certainly an error page or truncated download.
@@ -603,6 +601,40 @@ pub fn download_and_replace(download_url: &str) -> Result<PathBuf> {
     ))
 }
 
+/// Install a locally built executable using the updater's staged replacement.
+/// Windows can briefly retain image/file locks after the previous process exits.
+pub fn install_local_executable(source: &Path, destination: &Path) -> Result<()> {
+    install_local_with_timeout(source, destination, std::time::Duration::from_secs(30))
+}
+
+fn install_local_with_timeout(
+    source: &Path,
+    destination: &Path,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let bytes = std::fs::read(source).context("Cannot read the staged application")?;
+    let backup = destination.with_extension("exe.old");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match replace_executable(destination, &backup, &bytes) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                #[cfg(windows)]
+                let transient = error
+                    .chain()
+                    .filter_map(|e| e.downcast_ref::<std::io::Error>())
+                    .any(|e| matches!(e.raw_os_error(), Some(5 | 32 | 33)));
+                #[cfg(not(windows))]
+                let transient = false;
+                if !transient || std::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            },
+        }
+    }
+}
+
 fn replace_executable(exe_path: &Path, old_path: &Path, bytes: &[u8]) -> Result<()> {
     let staged = exe_path.with_extension(format!("exe.{}.new", std::process::id()));
     let mut file = std::fs::OpenOptions::new()
@@ -646,6 +678,15 @@ fn replace_executable(exe_path: &Path, old_path: &Path, bytes: &[u8]) -> Result<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fork_updates_stay_in_the_fork() {
+        assert_eq!(RELEASE_REPOSITORIES, &["righttang/GGScanner"]);
+        assert_eq!(
+            RELEASES_URL,
+            "https://github.com/righttang/GGScanner/releases/latest"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1017,6 +1058,59 @@ mod tests {
         replace_executable(&exe, &old, b"replacement").unwrap();
         assert_eq!(std::fs::read(&exe).unwrap(), b"replacement");
         assert_eq!(std::fs::read(&old).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_install_waits_for_windows_lock_and_preserves_backup() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = test_dir();
+        let exe = dir.join("scanner.exe");
+        let source = dir.join("built.exe");
+        std::fs::write(&exe, b"original").unwrap();
+        std::fs::write(&source, b"replacement").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&exe)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(lock);
+        });
+        let start = std::time::Instant::now();
+        install_local_with_timeout(&source, &exe, std::time::Duration::from_secs(3)).unwrap();
+        assert!(start.elapsed() >= std::time::Duration::from_millis(150));
+        assert_eq!(std::fs::read(&exe).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::read(exe.with_extension("exe.old")).unwrap(),
+            b"original"
+        );
+        release.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_install_timeout_keeps_locked_original_and_cleans_staging() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = test_dir();
+        let exe = dir.join("scanner.exe");
+        let source = dir.join("built.exe");
+        std::fs::write(&exe, b"original").unwrap();
+        std::fs::write(&source, b"replacement").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&exe)
+            .unwrap();
+        let result =
+            install_local_with_timeout(&source, &exe, std::time::Duration::from_millis(150));
+        assert!(result.is_err());
+        drop(lock);
+        assert_eq!(std::fs::read(&exe).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
         std::fs::remove_dir_all(dir).unwrap();
     }

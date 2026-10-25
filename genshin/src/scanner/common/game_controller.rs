@@ -391,6 +391,21 @@ impl GenshinGameController {
 
 // Navigation methods — all coordinates at 1920x1080 base, scaled by CoordScaler.
 impl GenshinGameController {
+    /// Click an actual client pixel, rejecting missing focus and out-of-window input.
+    pub fn click_client_at(&mut self, x: u32, y: u32) -> Result<()> {
+        let rect = self.game_info.window;
+        anyhow::ensure!(
+            rect.width > 0 && rect.height > 0 && x < rect.width as u32 && y < rect.height as u32,
+            "Click is outside the game client area"
+        );
+        anyhow::ensure!(
+            self.game_info.native_window().is_foreground(),
+            "Game window is not in the foreground"
+        );
+        self.system_control
+            .mouse_click_at(rect.left + x as i32, rect.top + y as i32)
+    }
+
     /// Click at a position specified in base 1920x1080 coordinates.
     ///
     /// Delegates to the platform backend: on Linux/Wayland the click may go

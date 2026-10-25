@@ -1629,6 +1629,7 @@ impl GoodCharacterScanner {
                 "[character] failed to open character screen after 3 attempts"
             );
             log_info!("{}", "{}", yas::lang::localize(DELAY_TIP));
+            bail!("未能确认角色界面，停止角色扫描 / Could not verify the character screen; character scan stopped");
         }
 
         // Jump to the specified character index

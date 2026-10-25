@@ -8,9 +8,11 @@ Windows scanner, capture, and manager for Genshin Impact and Honkai: Star Rail, 
 
 The same `GGScannerOCR.exe` and `GGScanner.exe` serve both games. Genshin data remains compatible [GOOD v3](https://frzyc.github.io/genshin-optimizer/#/doc); Star Rail scanner and capture write [HSR-Scanner v4](docs/HSR_EXPORT.md) (the Fribbels / Reliquary interchange, plus achievement and Trailblazer gender/path extensions).
 
-[![Build](https://github.com/Anyrainel/GGScanner/actions/workflows/rust.yml/badge.svg)](https://github.com/Anyrainel/GGScanner/actions)
+[![Build](https://github.com/righttang/GGScanner/actions/workflows/rust.yml/badge.svg)](https://github.com/righttang/GGScanner/actions)
 
 </div>
+
+This is righttang's fork of [Anyrainel/GGScanner](https://github.com/Anyrainel/GGScanner), retaining upstream functionality and attribution. Changes cover Windows HDR scanning, game-window input with delayed OCR feedback, an automatically started local service, scan progress and cancellation while listening, and a one-time authorized local launcher. See [Windows local control](docs/WINDOWS_LOCAL_CONTROL.md) and the [API contract](docs/MANAGER_API.md).
 
 ## Features
 
@@ -37,7 +39,7 @@ for one month after the first release under the new names. After that transition
 users who cannot auto-update can download a fresh copy from either companion
 website. See the [rename rollout](docs/RENAME_RELEASE.md).
 
-Download them from the [Releases](https://github.com/Anyrainel/GGScanner/releases) page. **There is no separate HSR executable to download.**
+Download this fork from its [Releases](https://github.com/righttang/GGScanner/releases) page; unpublished builds appear in [Actions](https://github.com/righttang/GGScanner/actions/workflows/rust.yml). **There is no separate HSR executable to download.**
 
 ### Achievement export semantics
 

@@ -775,6 +775,18 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Spawn a scan operation on a background thread.
 pub fn spawn_scan(state: &AppState) -> TaskHandle {
+    let local_client = state.local_scans.lock().unwrap().clone();
+    let server_counts = local_client.as_ref().map(|_| state.server_job.clone());
+    let server_phases = server_counts.clone();
+    let request = genshin_scanner::manager::models::ScanRequest {
+        characters: state.scan_characters,
+        weapons: state.scan_weapons,
+        artifacts: state.scan_artifacts,
+        achievements: state.scan_achievements,
+        artifact_mode: Default::default(),
+        artifact_limit: None,
+    };
+    let lang = state.lang;
     let status = state.scan_status.clone();
     let progress = state.scan_progress.clone();
     {
@@ -818,17 +830,12 @@ pub fn spawn_scan(state: &AppState) -> TaskHandle {
     let stopping_msg = UiText::new("正在停止扫描...", "Stopping scan...");
     let native_crash = Arc::new(NativeCrashState::new());
 
-    let handle = match spawn_with_safety_net(
-        TaskKind::Scanner,
-        LogSource::Scanner,
-        status.clone(),
-        native_crash.clone(),
-        move |status| {
-            // Check VC++ runtime before loading ONNX
-            #[cfg(target_os = "windows")]
-            {
-                if let Err(e) = genshin_scanner::cli::check_vcpp_runtime() {
-                    set_task_failure(
+    let run = move |status: Arc<Mutex<TaskStatus>>| {
+        // Check VC++ runtime before loading ONNX
+        #[cfg(target_os = "windows")]
+        {
+            if let Err(e) = genshin_scanner::cli::check_vcpp_runtime() {
+                set_task_failure(
                         &status,
                         UiError::from_anyhow(
                             UiText::new(
@@ -838,16 +845,16 @@ pub fn spawn_scan(state: &AppState) -> TaskHandle {
                             &e,
                         ),
                     );
-                    return;
-                }
+                return;
             }
+        }
 
-            // Ensure ONNX runtime on the worker thread
-            #[cfg(any(target_os = "windows", target_os = "linux"))]
-            {
-                if !genshin_scanner::cli::check_onnxruntime() {
-                    if let Err(e) = genshin_scanner::cli::download_onnxruntime() {
-                        set_task_failure(
+        // Ensure ONNX runtime on the worker thread
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            if !genshin_scanner::cli::check_onnxruntime() {
+                if let Err(e) = genshin_scanner::cli::download_onnxruntime() {
+                    set_task_failure(
                             &status,
                             UiError::from_anyhow(
                                 UiText::new(
@@ -857,91 +864,186 @@ pub fn spawn_scan(state: &AppState) -> TaskHandle {
                                 &e,
                             ),
                         );
-                        return;
-                    }
-                }
-            }
-
-            let status_for_cb = status.clone();
-            // Once the cancel token is tripped, don't let deeper phases
-            // overwrite the "Stopping..." message with their own progress.
-            let cancel_for_cb = cancel_for_result.clone();
-            let stopping_msg_cb = UiText::new("正在停止扫描...", "Stopping scan...");
-            let status_fn = move |msg: &str| {
-                if cancel_for_cb.is_cancelled() {
-                    *status_for_cb.lock().unwrap() = TaskStatus::Running(stopping_msg_cb.clone());
                     return;
                 }
-                let phase = UiText::from_bilingual(msg);
-                *status_for_cb.lock().unwrap() = TaskStatus::Running(phase);
-            };
-
-            let counts = |completed, total, _id: &str, key: &str| {
-                use super::task_progress::StepState;
-                if let Some(step) = progress
-                    .lock()
-                    .unwrap()
-                    .steps
-                    .iter_mut()
-                    .find(|s| s.key == key)
-                {
-                    step.completed = completed;
-                    step.total = if key != "characters" && total > 0 {
-                        Some(total)
-                    } else {
-                        None
-                    };
-                    step.state = StepState::Running;
-                }
-            };
-            let phases = |key: &str, event| {
-                use super::task_progress::StepState;
-                use genshin_scanner::scanner::common::progress::ScanPhaseEvent;
-                if let Some(step) = progress
-                    .lock()
-                    .unwrap()
-                    .steps
-                    .iter_mut()
-                    .find(|s| s.key == key)
-                {
-                    step.state = match event {
-                        ScanPhaseEvent::Started => StepState::Running,
-                        ScanPhaseEvent::Complete(count) => {
-                            step.completed = count;
-                            StepState::Complete
-                        },
-                        ScanPhaseEvent::Interrupted => StepState::Interrupted,
-                    };
-                }
-            };
-            let result = genshin_scanner::cli::run_scan_core_observed(
-                &user_config,
-                &scan_config,
-                Some(&status_fn),
-                Some(token),
-                Some(&counts),
-                Some(&phases),
-            );
-            progress.lock().unwrap().interrupt_unfinished();
-            let outcome = scan_result_status(
-                result,
-                &progress.lock().unwrap(),
-                cancel_for_result.is_cancelled(),
-            );
-            if let TaskStatus::Failed(error) = outcome {
-                set_task_failure(&status, error);
-            } else {
-                *status.lock().unwrap() = outcome;
             }
-        },
-    ) {
-        Ok(handle) => Some(handle),
-        Err(error) => {
-            set_task_failure(&status, error);
-            None
-        },
-    };
+        }
 
+        let status_for_cb = status.clone();
+        // Once the cancel token is tripped, don't let deeper phases
+        // overwrite the "Stopping..." message with their own progress.
+        let cancel_for_cb = cancel_for_result.clone();
+        let stopping_msg_cb = UiText::new("正在停止扫描...", "Stopping scan...");
+        let status_fn = move |msg: &str| {
+            if cancel_for_cb.is_cancelled() {
+                *status_for_cb.lock().unwrap() = TaskStatus::Running(stopping_msg_cb.clone());
+                return;
+            }
+            let phase = UiText::from_bilingual(msg);
+            *status_for_cb.lock().unwrap() = TaskStatus::Running(phase);
+        };
+
+        let counts = |completed, total, _id: &str, key: &str| {
+            if let Some(server) = &server_counts {
+                genshin_scanner::server::record_scan_count(server, completed, total, key);
+            }
+            use super::task_progress::StepState;
+            if let Some(step) = progress
+                .lock()
+                .unwrap()
+                .steps
+                .iter_mut()
+                .find(|s| s.key == key)
+            {
+                step.completed = completed;
+                step.total = if key != "characters" && total > 0 {
+                    Some(total)
+                } else {
+                    None
+                };
+                step.state = StepState::Running;
+            }
+        };
+        let phases = |key: &str, event| {
+            if let Some(server) = &server_phases {
+                genshin_scanner::server::record_scan_phase(server, key, event);
+            }
+            use super::task_progress::StepState;
+            use genshin_scanner::scanner::common::progress::ScanPhaseEvent;
+            if let Some(step) = progress
+                .lock()
+                .unwrap()
+                .steps
+                .iter_mut()
+                .find(|s| s.key == key)
+            {
+                step.state = match event {
+                    ScanPhaseEvent::Started => StepState::Running,
+                    ScanPhaseEvent::Complete(count) => {
+                        step.completed = count;
+                        StepState::Complete
+                    },
+                    ScanPhaseEvent::Interrupted => StepState::Interrupted,
+                };
+            }
+        };
+        let result = genshin_scanner::cli::run_scan_core_observed(
+            &user_config,
+            &scan_config,
+            Some(&status_fn),
+            Some(token),
+            Some(&counts),
+            Some(&phases),
+        );
+        progress.lock().unwrap().interrupt_unfinished();
+        let outcome = scan_result_status(
+            result,
+            &progress.lock().unwrap(),
+            cancel_for_result.is_cancelled(),
+        );
+        if let TaskStatus::Failed(error) = outcome {
+            set_task_failure(&status, error);
+        } else {
+            *status.lock().unwrap() = outcome;
+        }
+    };
+    let handle = if let Some(client) = local_client {
+        let operation_status = status.clone();
+        let operation = Box::new(move || {
+            log_bridge::with_thread_log_source(
+                LogSource::Scanner,
+                || run(operation_status.clone()),
+            );
+            match &*lock_recover(&operation_status) {
+                TaskStatus::Exported { path, .. } => Ok(path.clone()),
+                TaskStatus::Failed(error) => Err(anyhow::anyhow!(error.copy_text(lang))),
+                _ => Err(anyhow::anyhow!("the scan stopped without an export")),
+            }
+        });
+        match client.submit(request, stop_token.clone(), operation) {
+            Ok(done) => {
+                let bridge_status = status.clone();
+                thread::Builder::new()
+                    .name("scanner-progress".into())
+                    .spawn(move || loop {
+                        match done.recv_timeout(std::time::Duration::from_millis(100)) {
+                            Ok(Ok(_)) => break,
+                            Ok(Err(error)) => {
+                                if !matches!(
+                                    *lock_recover(&bridge_status),
+                                    TaskStatus::Failed(_) | TaskStatus::Stopped(_)
+                                ) {
+                                    set_task_failure(
+                                        &bridge_status,
+                                        UiError::from_anyhow(
+                                            UiText::new(
+                                                "扫描未能完成。",
+                                                "The scan could not finish.",
+                                            ),
+                                            &error,
+                                        ),
+                                    );
+                                }
+                                break;
+                            },
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                                if !client.is_stopping() => {},
+                            Err(_) => {
+                                set_task_failure(
+                                    &bridge_status,
+                                    UiError::from_message(
+                                        UiText::new(
+                                            "扫描服务已停止。",
+                                            "The scan service stopped.",
+                                        ),
+                                        "local scan completion channel closed",
+                                    ),
+                                );
+                                break;
+                            },
+                        }
+                    })
+                    .map(Some)
+                    .unwrap_or_else(|error| {
+                        set_task_failure(
+                            &status,
+                            UiError::from_error(
+                                UiText::new("无法跟踪扫描状态。", "Could not track the scan."),
+                                error,
+                            ),
+                        );
+                        None
+                    })
+            },
+            Err(error) => {
+                set_task_failure(
+                    &status,
+                    UiError::from_anyhow(
+                        UiText::new(
+                            "另一个任务正在运行，请稍后重试。",
+                            "Another task is running; retry shortly.",
+                        ),
+                        &error,
+                    ),
+                );
+                None
+            },
+        }
+    } else {
+        match spawn_with_safety_net(
+            TaskKind::Scanner,
+            LogSource::Scanner,
+            status.clone(),
+            native_crash.clone(),
+            run,
+        ) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                set_task_failure(&status, error);
+                None
+            },
+        }
+    };
     TaskHandle {
         _handle: handle,
         task: TaskKind::Scanner,
@@ -1054,6 +1156,7 @@ mod feedback_tests {
 pub fn spawn_server(state: &AppState) -> TaskHandle {
     let status = state.server_status.clone();
     let job = state.server_job.clone();
+    let local_scans = state.local_scans.clone();
     *job.lock().unwrap() = genshin_scanner::manager::models::JobState::idle();
     let user_config = state.user_config.clone();
     let port = state.server_port;
@@ -1131,7 +1234,7 @@ pub fn spawn_server(state: &AppState) -> TaskHandle {
                 );
             });
 
-            match genshin_scanner::cli::run_server_core_observed(
+            match genshin_scanner::cli::run_server_core_with_local_scans(
                 &user_config,
                 port,
                 &genshin_scanner::cli::OcrEngineArgs::default(),
@@ -1143,6 +1246,7 @@ pub fn spawn_server(state: &AppState) -> TaskHandle {
                 dump_job_data,
                 Some(status_fn),
                 Some(job),
+                Some(local_scans.clone()),
             ) {
                 Ok(()) => {
                     *status.lock().unwrap() =
@@ -1161,6 +1265,7 @@ pub fn spawn_server(state: &AppState) -> TaskHandle {
                     );
                 },
             }
+            *local_scans.lock().unwrap() = None;
         },
     ) {
         Ok(handle) => Some(handle),

@@ -68,9 +68,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p yas_core --features ort --lib --test window_enumeration
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p genshin_scanner --lib scan_worker::tests
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p genshin_scanner --lib updater::tests
+          cargo test -p genshin_scanner --lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p good_tools_app --features test-as-invoker --test ui_error --test update_restart --test shared_games --test gui_layout --test gui_feedback
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

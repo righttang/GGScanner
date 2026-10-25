@@ -45,6 +45,24 @@ use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 use crate::capture::Capturer;
 use crate::positioning::{Pos, Rect};
 
+/// WGC timestamps and QPC share a clock; WGC expresses it in 100 ns units.
+fn capture_time() -> Result<i64> {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+    let mut counter = 0;
+    let mut frequency = 0;
+    unsafe {
+        if QueryPerformanceCounter(&mut counter) == 0
+            || QueryPerformanceFrequency(&mut frequency) == 0
+            || frequency <= 0
+        {
+            return Err(anyhow!("WGC: cannot read capture clock"));
+        }
+    }
+    Ok((i128::from(counter) * 10_000_000 / i128::from(frequency)) as i64)
+}
+
 pub struct WgcCapturer {
     d3d_device: ID3D11Device,
     d3d_context: ID3D11DeviceContext,
@@ -119,16 +137,26 @@ impl WgcCapturer {
     }
 
     fn grab_frame(&self) -> Result<RgbImage> {
+        // Sleeping after navigation does not empty the frame pool. Its first
+        // queued frame can still show the previous tab, or even the main world.
+        // Only accept a frame produced after this capture was requested.
+        let requested_at = capture_time()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         let frame = {
-            let mut f = None;
-            for _ in 0..20 {
-                f = self.frame_pool.TryGetNextFrame().ok();
-                if f.is_some() {
-                    break;
+            loop {
+                if let Ok(frame) = self.frame_pool.TryGetNextFrame() {
+                    if frame.SystemRelativeTime()?.Duration >= requested_at {
+                        break frame;
+                    }
+                    frame.Close()?;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "WGC: no fresh frame received within 500 ms timeout"
+                    ));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            f.ok_or_else(|| anyhow!("WGC: no frame received within 200 ms timeout"))?
         };
 
         let content_size = frame.ContentSize()?;
@@ -209,6 +237,7 @@ impl WgcCapturer {
         };
 
         unsafe { self.d3d_context.Unmap(&staging, 0) };
+        frame.Close()?;
 
         Ok(img)
     }
