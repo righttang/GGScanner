@@ -1,4 +1,5 @@
 mod gesture;
+pub mod key_hold;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

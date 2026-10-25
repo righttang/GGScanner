@@ -44,8 +44,11 @@ Stop-ScheduledTask -TaskName $launcher.taskName
 OCR 区域。输入会校验窗口、边界与焦点。`requestId` 用于去重；超时后查询
 `GET /input/result?jobId=...`，不要换 ID 重复提交。回执仅在服务进程内保留最近 64 项。
 
-可选 `key` 只接受固定游戏动作：`menu`、`partySetup`、`inventory`、`character`、
-`map`、`interact`、`confirm`。Windows 可用 `text` 在指定游戏输入框中替换 1–64 个
+独立 `POST /input/key` 支持 WASD、跳跃、冲刺、E/Q、角色切换及固定导航动作。
+例如 `{"requestId":"walk-one","key":"w","holdMs":180,"delayMs":500}`。
+`holdMs` 为0–3000毫秒，0表示点按，松键后等待再OCR。长按期间可以查询或停止，
+失去焦点、右键中断、出错及异常展开均会尝试松键。先短按并确认位置，时长不等于
+精确路程。Windows 可用 `text` 在指定游戏输入框中替换 1–64 个
 可打印字符。`key` 与 `text` 不能同时提供。游戏自身的队名长度限制仍然适用。
 `/input/*` 仅接受无 Origin 的本机客户端或 loopback Origin；服务不绑定外网地址。
 

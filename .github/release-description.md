@@ -6,7 +6,7 @@
 
 - 修复 Windows HDR 下的图像时序与圣遗物识别问题。
 - 原神本机服务随程序启动，扫描期间仍可查询进度及请求停止。
-- 新增游戏窗口点击、固定导航与延迟 OCR 回馈，支持外部工具协作。
+- 新增游戏窗口点击、短时按键移动与延迟 OCR 回馈，支持外部工具协作。
 
 | 下载版本 | 功能 |
 | --- | --- |
@@ -25,7 +25,7 @@ In this update:
 
 - Fixed Windows HDR capture timing and Artifact recognition.
 - The Genshin local service starts with the app and stays responsive to progress and stop requests during scans.
-- Added game-window clicks, fixed navigation actions, and delayed OCR feedback for companion tools.
+- Added game-window clicks, short key holds for movement, and delayed OCR feedback for companion tools.
 
 | Download | Features |
 | --- | --- |

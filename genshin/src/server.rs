@@ -145,6 +145,14 @@ pub trait ManageExecutor {
         ClickFeedback::failed("Game input is not supported by this executor")
     }
 
+    fn execute_click_with_cancel(
+        &mut self,
+        request: &ClickRequest,
+        _token: yas::cancel::CancelToken,
+    ) -> ClickFeedback {
+        self.execute_click(request)
+    }
+
     /// Recheck task data even when the game/OCR executor is reused by the server.
     fn prepare_task(&mut self) -> Result<()> {
         Ok(())
@@ -192,7 +200,15 @@ pub struct GameExecutor {
 
 impl ManageExecutor for GameExecutor {
     fn execute_click(&mut self, request: &ClickRequest) -> ClickFeedback {
-        game_input::execute_game_click(self, request)
+        game_input::execute_game_click(self, request, yas::cancel::CancelToken::new())
+    }
+
+    fn execute_click_with_cancel(
+        &mut self,
+        request: &ClickRequest,
+        token: yas::cancel::CancelToken,
+    ) -> ClickFeedback {
+        game_input::execute_game_click(self, request, token)
     }
 
     fn prepare_task(&mut self) -> Result<()> {
@@ -903,6 +919,16 @@ where
             }
 
             match (method, url.as_str()) {
+                (Method::Post, "/input/key") => {
+                    game_input::handle_key(
+                        request,
+                        &http_enabled,
+                        &http_state,
+                        &http_job_tx,
+                        &http_input_receipts,
+                        cors_ref,
+                    );
+                },
                 (Method::Post, "/input/click") => {
                     game_input::handle_click(
                         request,
@@ -1219,12 +1245,20 @@ where
                 weapon_cache.lock().unwrap().invalidate();
                 artifact_cache.lock().unwrap().invalidate();
                 achievement_cache.lock().unwrap().invalidate();
-                let feedback = game_input::execute_task(&task, &mut executor, &mut init_executor);
+                let token = local_scan::cancel_token(&active_cancel, &job_id);
+                let feedback = game_input::execute_task(
+                    &task,
+                    &mut executor,
+                    &mut init_executor,
+                    token.clone(),
+                );
                 input_receipts
                     .lock()
                     .unwrap()
                     .finish(&job_id, feedback.clone());
-                let instruction = if feedback.clicked == Some(true) {
+                let instruction = if token.is_cancelled() {
+                    InstructionResult::outcome(&job_id, InstructionStatus::Aborted)
+                } else if feedback.clicked == Some(true) && feedback.error.is_none() {
                     InstructionResult::outcome(&job_id, InstructionStatus::Success)
                 } else {
                     let source = anyhow!(feedback

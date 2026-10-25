@@ -1,6 +1,6 @@
 # GGScanner HTTP API
 
-Server: `http://127.0.0.1:{port}` (default 8765)
+Server: `http://127.0.0.1:{port}` (Windows GUI startup uses 18765; CLI default 8765)
 
 The application defaults to filtering the requested artifact sets and stops
 management once all targets are matched. Management does not refresh full
@@ -74,9 +74,9 @@ Body: `{"jobId":"the-current-job-id"}` (maximum 4 KiB).
 Returns `{"jobId":"...","stopRequested":true}` after signalling cancellation.
 Poll the same job until terminal before starting another. Repeating this for the
 completed current job returns `stopRequested:false`; an unknown or old job ID
-returns 404 and never stops a newer job. An already submitted individual click
-returns 409 because input cannot be undone. Stopping a job leaves the service
-listening.
+returns 404 and never stops a newer job. A held key observes cancellation and
+releases the key. Cancellation cannot undo a click/key already sent; inspect the
+input receipt and game state. Stopping a job leaves the service listening.
 
 For an explicitly authorized local installation, launching the Windows binary
 once with `--install-local-launcher` registers an on-demand Task Scheduler task
@@ -89,6 +89,40 @@ Windows elevation is not disabled.
 
 ## Endpoints
 
+### `POST /input/key` (asynchronous keyboard input)
+
+```json
+{"requestId":"walk-step-001","key":"w","holdMs":180,"delayMs":500,"ocr":[]}
+```
+
+Keyboard requests omit mouse coordinates. `holdMs` defaults to 0 (tap) and accepts
+0–3000 milliseconds. The key is released before the `delayMs` wait and optional
+OCR. Holding is Windows-only; other platforms reject held requests before input.
+Each request uses one key, not a combination or persistent key-down state.
+
+| Action | Accepted names |
+| --- | --- |
+| Movement | `forward`/`w`, `backward`/`s`, `left`/`a`, `right`/`d` |
+| Jump / sprint | `jump`/`space`, `sprint`/`shift` |
+| Skill / burst | `skill`/`e`, `burst`/`q` |
+| Party slots | `party1`–`party4` or `1`–`4` |
+| Navigation | `menu`/`esc`/`escape`, `partySetup`/`l`, `inventory`/`b`, `character`/`c`, `map`/`m`, `interact`/`f`, `confirm`/`enter`/`return` |
+
+Letter aliases also accept uppercase. Arbitrary system shortcuts are rejected.
+Mouse coordinates, `text` and unknown fields are rejected by this route. OCR,
+origin checks, admission and receipt rules are the same as `/input/click`.
+
+The initial response is HTTP 202. Poll `/input/result?jobId=walk-step-001` for the
+final feedback; `/health`, `/status` and `/stop` remain responsive while holding.
+Normal completion, errors and unwinding attempt key release. Focus loss, right
+mouse cancellation or `/stop` interrupt a hold, checked every 20 milliseconds.
+Forced process termination cannot provide normal cleanup guarantees.
+
+Use short movements and observe the game before continuing: duration is not a
+fixed distance. Check teleport completion and the intended interaction prompt
+before walking or pressing `interact`. A receipt confirms input, not arrival at
+the forge or success of a resource-consuming operation.
+
 ### `POST /input/click` (click, wait, then OCR)
 
 Coordinates and OCR rectangles are actual pixels relative to the game client
@@ -96,7 +130,7 @@ area, matching a game-window screenshot. They are not desktop coordinates or
 the scanner's scaled 1920×1080 navigation coordinates.
 
 The same serialized endpoint optionally accepts `key` for fixed game navigation:
-`menu`, `partySetup`, `inventory`, `character`, `map`, `interact`, or `confirm`.
+the same key names as `/input/key`, including bounded `holdMs` for Windows.
 For example, `{"x":0,"y":0,"key":"partySetup","delayMs":1500}` opens party
 configuration without a mouse click. Arbitrary keys and system shortcuts are
 rejected. On Windows, `text` instead clicks the supplied coordinate and replaces
@@ -155,7 +189,8 @@ the same ID returns 409. IDs use 1–128 letters, digits, underscores, or hyphen
 The last 64 receipts are retained in memory until server restart. If omitted,
 the server generates a job ID, and automatic POST retries are unsafe.
 
-If work takes more than 15 seconds, POST returns HTTP 202 with `jobId` and
+Held-key requests return HTTP 202 immediately; ordinary clicks that take more
+than 15 seconds also return HTTP 202 with `jobId` and
 `state:"running"`. Poll `GET /input/result?jobId=<id>` for the delayed feedback;
 do not submit a replacement click. Pending results return 202; completed results
 return 200; unknown or expired IDs return 404. `GET /status` also reflects the

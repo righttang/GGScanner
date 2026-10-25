@@ -28,6 +28,8 @@ pub struct ClickRequest {
     pub key: Option<GameKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(default)]
+    pub hold_ms: u64,
     #[serde(default = "default_delay")]
     pub delay_ms: u64,
     #[serde(default)]
@@ -38,13 +40,44 @@ pub struct ClickRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GameKey {
+    #[serde(alias = "esc", alias = "escape")]
     Menu,
+    #[serde(alias = "l", alias = "L")]
     PartySetup,
+    #[serde(alias = "b", alias = "B")]
     Inventory,
+    #[serde(alias = "c", alias = "C")]
     Character,
+    #[serde(alias = "m", alias = "M")]
     Map,
+    #[serde(alias = "f", alias = "F")]
     Interact,
+    #[serde(alias = "enter", alias = "return")]
     Confirm,
+    #[serde(alias = "w", alias = "W")]
+    Forward,
+    #[serde(alias = "s", alias = "S")]
+    Backward,
+    #[serde(alias = "a", alias = "A")]
+    Left,
+    #[serde(alias = "d", alias = "D")]
+    Right,
+    #[serde(alias = "space")]
+    Jump,
+    #[serde(alias = "shift")]
+    Sprint,
+    #[serde(alias = "e", alias = "E")]
+    Skill,
+    #[serde(alias = "q", alias = "Q")]
+    Burst,
+    #[serde(alias = "1")]
+    Party1,
+    #[serde(alias = "2")]
+    Party2,
+    #[serde(alias = "3")]
+    Party3,
+    #[serde(alias = "4")]
+    Party4,
 }
 
 impl GameKey {
@@ -57,6 +90,48 @@ impl GameKey {
             Self::Map => enigo::Key::Layout('m'),
             Self::Interact => enigo::Key::Layout('f'),
             Self::Confirm => enigo::Key::Return,
+            Self::Forward => enigo::Key::Layout('w'),
+            Self::Backward => enigo::Key::Layout('s'),
+            Self::Left => enigo::Key::Layout('a'),
+            Self::Right => enigo::Key::Layout('d'),
+            Self::Jump => enigo::Key::Space,
+            Self::Sprint => enigo::Key::Shift,
+            Self::Skill => enigo::Key::Layout('e'),
+            Self::Burst => enigo::Key::Layout('q'),
+            Self::Party1 => enigo::Key::Layout('1'),
+            Self::Party2 => enigo::Key::Layout('2'),
+            Self::Party3 => enigo::Key::Layout('3'),
+            Self::Party4 => enigo::Key::Layout('4'),
+        }
+    }
+}
+
+/// Keyboard-only route; callers do not need dummy mouse coordinates.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KeyRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    key: GameKey,
+    #[serde(default)]
+    hold_ms: u64,
+    #[serde(default = "default_delay")]
+    delay_ms: u64,
+    #[serde(default)]
+    ocr: Vec<OcrRegion>,
+}
+
+impl From<KeyRequest> for ClickRequest {
+    fn from(r: KeyRequest) -> Self {
+        Self {
+            request_id: r.request_id,
+            x: 0,
+            y: 0,
+            key: Some(r.key),
+            text: None,
+            hold_ms: r.hold_ms,
+            delay_ms: r.delay_ms,
+            ocr: r.ocr,
         }
     }
 }
@@ -67,6 +142,11 @@ fn default_delay() -> u64 {
 
 impl ClickRequest {
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.hold_ms <= 3_000, "holdMs must be between 0 and 3000");
+        anyhow::ensure!(
+            self.hold_ms == 0 || self.key.is_some(),
+            "holdMs requires a key"
+        );
         anyhow::ensure!(
             self.key.is_none() || self.text.is_none(),
             "Choose key or text, not both"
@@ -230,12 +310,35 @@ pub(super) fn local_origin_only(origin: Option<&str>) -> bool {
 }
 
 pub(super) fn handle_click(
+    request: tiny_http::Request,
+    enabled: &AtomicBool,
+    state: &Arc<Mutex<JobState>>,
+    job_tx: &mpsc::Sender<(String, ExecutionRequest)>,
+    receipts: &Arc<Mutex<InputReceipts>>,
+    origin: Option<&str>,
+) {
+    handle_input(request, enabled, state, job_tx, receipts, origin, false);
+}
+
+pub(super) fn handle_key(
+    request: tiny_http::Request,
+    enabled: &AtomicBool,
+    state: &Arc<Mutex<JobState>>,
+    job_tx: &mpsc::Sender<(String, ExecutionRequest)>,
+    receipts: &Arc<Mutex<InputReceipts>>,
+    origin: Option<&str>,
+) {
+    handle_input(request, enabled, state, job_tx, receipts, origin, true);
+}
+
+fn handle_input(
     mut request: tiny_http::Request,
     enabled: &AtomicBool,
     state: &Arc<Mutex<JobState>>,
     job_tx: &mpsc::Sender<(String, ExecutionRequest)>,
     receipts: &Arc<Mutex<InputReceipts>>,
     origin: Option<&str>,
+    key_only: bool,
 ) {
     if !enabled.load(Ordering::Relaxed) {
         respond_error(
@@ -272,7 +375,12 @@ pub(super) fn handle_click(
         );
         return;
     }
-    let click: ClickRequest = match serde_json::from_str(&body) {
+    let parsed = if key_only {
+        serde_json::from_str::<KeyRequest>(&body).map(Into::into)
+    } else {
+        serde_json::from_str::<ClickRequest>(&body)
+    };
+    let click: ClickRequest = match parsed {
         Ok(click) => click,
         Err(error) => {
             respond_error_with_diagnostic(
@@ -330,6 +438,7 @@ pub(super) fn handle_click(
         *state = JobState::running(id.clone(), 1);
     }
     receipts.lock().unwrap().insert(id.clone(), click.clone());
+    let asynchronous = key_only || click.hold_ms > 0;
     save_request("input_click", &body);
     let (reply, rx) = mpsc::sync_channel(1);
     if job_tx
@@ -346,6 +455,10 @@ pub(super) fn handle_click(
         receipts.lock().unwrap().finish(&id, feedback.clone());
         *state.lock().unwrap() = JobState::idle();
         respond_receipt(request, &id, Some(&feedback), origin);
+        return;
+    }
+    if asynchronous {
+        respond_receipt(request, &id, None, origin);
         return;
     }
     match rx.recv_timeout(Duration::from_secs(15)) {
@@ -384,9 +497,19 @@ pub(super) fn handle_result(
     }
 }
 
-pub(super) fn execute_game_click(exec: &mut GameExecutor, request: &ClickRequest) -> ClickFeedback {
+pub(super) fn execute_game_click(
+    exec: &mut GameExecutor,
+    request: &ClickRequest,
+    token: yas::cancel::CancelToken,
+) -> ClickFeedback {
     let mut feedback = ClickFeedback::failed("Click was not executed");
     let execute = (|| -> Result<()> {
+        exec.ctrl.set_cancel_token(token.clone());
+        #[cfg(not(target_os = "windows"))]
+        anyhow::ensure!(
+            request.hold_ms == 0,
+            "Held game keys are currently supported on Windows only"
+        );
         exec.ctrl.focus_game_window_quick();
         let rect = exec.ctrl.game_info.window;
         request.validate_window(rect.width.max(0) as u32, rect.height.max(0) as u32)?;
@@ -396,8 +519,6 @@ pub(super) fn execute_game_click(exec: &mut GameExecutor, request: &ClickRequest
             exec.ctrl.game_info.native_window().is_foreground(),
             "Game window could not be focused"
         );
-        let token = yas::cancel::CancelToken::new();
-        exec.ctrl.set_cancel_token(token);
         anyhow::ensure!(
             !exec.ctrl.check_rmb(),
             "Click cancelled by right mouse button"
@@ -405,7 +526,39 @@ pub(super) fn execute_game_click(exec: &mut GameExecutor, request: &ClickRequest
         // A backend error can occur after partial input; never label it unclicked.
         feedback.clicked = None;
         if let Some(key) = request.key {
-            exec.ctrl.system_control.key_press(key.input_key())?;
+            if request.hold_ms == 0 {
+                exec.ctrl.system_control.key_press(key.input_key())?;
+            } else {
+                #[cfg(target_os = "windows")]
+                {
+                    let window = exec.ctrl.game_info.native_window();
+                    yas::system_control::key_hold::with_held_key(
+                        &mut exec.ctrl.system_control,
+                        key.input_key(),
+                        || {
+                            let deadline =
+                                std::time::Instant::now() + Duration::from_millis(request.hold_ms);
+                            loop {
+                                anyhow::ensure!(
+                                    !token.check_rmb(),
+                                    "Held key cancelled; key released"
+                                );
+                                anyhow::ensure!(
+                                    window.is_foreground(),
+                                    "Game focus lost; key released"
+                                );
+                                let remaining =
+                                    deadline.saturating_duration_since(std::time::Instant::now());
+                                if remaining.is_zero() {
+                                    break;
+                                }
+                                std::thread::sleep(remaining.min(Duration::from_millis(20)));
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
+            }
         } else {
             exec.ctrl.click_client_at(request.x, request.y)?;
             if let Some(text) = &request.text {
@@ -467,17 +620,20 @@ pub(super) fn execute_task<F>(
     task: &InputTask,
     executor: &mut Option<Box<dyn ManageExecutor>>,
     init: &mut F,
+    token: yas::cancel::CancelToken,
 ) -> ClickFeedback
 where
     F: FnMut() -> Result<Box<dyn ManageExecutor>>,
 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        anyhow::ensure!(!token.is_cancelled(), "Input cancelled before execution");
         if executor.is_none() {
             *executor = Some(init()?);
         }
         let executor = executor.as_mut().unwrap();
         executor.prepare_task()?;
-        Ok::<_, anyhow::Error>(executor.execute_click(&task.request))
+        anyhow::ensure!(!token.is_cancelled(), "Input cancelled before execution");
+        Ok::<_, anyhow::Error>(executor.execute_click_with_cancel(&task.request, token))
     })) {
         Ok(Ok(feedback)) => feedback,
         Ok(Err(error)) => ClickFeedback::failed(format!("{error:#}")),
@@ -505,6 +661,23 @@ mod tests {
     }
 
     impl ManageExecutor for FakeInput {
+        fn execute_click_with_cancel(
+            &mut self,
+            request: &ClickRequest,
+            token: yas::cancel::CancelToken,
+        ) -> ClickFeedback {
+            let mut feedback = self.execute_click(request);
+            let deadline = std::time::Instant::now() + Duration::from_millis(request.hold_ms);
+            while std::time::Instant::now() < deadline {
+                if token.is_cancelled() {
+                    feedback.error = Some("Held key cancelled; key released".into());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            feedback
+        }
+
         fn execute_click(&mut self, request: &ClickRequest) -> ClickFeedback {
             if let Err(error) = request.validate_window(1920, 1080) {
                 return ClickFeedback::failed(error);
@@ -678,6 +851,103 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn keyboard_only_schema_rejects_mouse_fields_unknown_keys_and_unbounded_holds() {
+        for key in [
+            "w", "W", "a", "s", "d", "space", "shift", "e", "q", "1", "party4",
+        ] {
+            let request: ClickRequest = serde_json::from_value::<KeyRequest>(serde_json::json!({
+                "key":key,"holdMs":3000
+            }))
+            .unwrap()
+            .into();
+            assert!(request.validate().is_ok());
+        }
+        let server = TestServer::new();
+        for body in [
+            r#"{}"#,
+            r#"{"key":"winR"}"#,
+            r#"{"key":"w","holdMs":3001}"#,
+            r#"{"key":"w","x":100}"#,
+            r#"{"key":"w","text":"other input"}"#,
+        ] {
+            assert_eq!(
+                server.request("POST", "/input/key", body, None).0,
+                400,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            server
+                .request("POST", "/input/click", r#"{"x":1,"y":1,"holdMs":1}"#, None)
+                .0,
+            400
+        );
+        assert!(server.clicks.lock().unwrap().is_empty());
+        assert_eq!(
+            server
+                .request(
+                    "POST",
+                    "/input/key",
+                    r#"{"key":"w"}"#,
+                    Some("https://ggartifact.com")
+                )
+                .0,
+            403
+        );
+    }
+
+    #[test]
+    fn held_key_is_async_stoppable_pollable_and_not_repeated() {
+        let server = TestServer::new();
+        let body = r#"{"requestId":"walk-once","key":"w","holdMs":3000,"delayMs":0}"#;
+        let started = std::time::Instant::now();
+        assert_eq!(server.request("POST", "/input/key", body, None).0, 202);
+        assert_eq!(server.request("GET", "/health", "", None).0, 200);
+        assert_eq!(
+            server.request("GET", "/status", "", None).1["state"],
+            "running"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "HTTP listener blocked for held input"
+        );
+        assert_eq!(server.request("POST", "/input/key", body, None).0, 202);
+        assert_eq!(
+            server
+                .request("POST", "/input/key", &body.replace("3000", "2000"), None)
+                .0,
+            409
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while server.clicks.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (status, stopped) = server.request("POST", "/stop", r#"{"jobId":"walk-once"}"#, None);
+        assert_eq!(status, 200);
+        assert_eq!(stopped["stopRequested"], true);
+        loop {
+            let (status, result) = server.request("GET", "/input/result?jobId=walk-once", "", None);
+            if status == 200 {
+                assert_eq!(result["feedback"]["clicked"], true);
+                assert!(result["feedback"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cancelled"));
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            server.request("GET", "/status", "", None).1["summary"]["aborted"],
+            1
+        );
+        assert_eq!(server.request("POST", "/input/key", body, None).0, 200);
+        assert_eq!(server.clicks.lock().unwrap().len(), 1);
     }
 
     #[test]

@@ -100,6 +100,18 @@ impl WindowsSystemControl {
     }
 }
 
+impl crate::system_control::key_hold::KeyDriver for WindowsSystemControl {
+    fn key_down(&mut self, key: Key) -> anyhow::Result<()> {
+        self.enigo.key_down(key);
+        Ok(())
+    }
+
+    fn key_up(&mut self, key: Key) -> anyhow::Result<()> {
+        self.enigo.key_up(key);
+        Ok(())
+    }
+}
+
 impl crate::system_control::gesture::DragDriver for WindowsSystemControl {
     fn move_to(&mut self, x: i32, y: i32) -> anyhow::Result<()> {
         self.mouse_move_to(x, y)

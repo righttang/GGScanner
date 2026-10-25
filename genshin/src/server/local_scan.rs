@@ -162,16 +162,6 @@ pub(super) fn handle_stop(
         return;
     }
     let running = current.state == JobPhase::Running;
-    if running && current.ui.kind.is_none() {
-        respond_error(
-            request,
-            409,
-            "当前点击已提交，请等待反馈。",
-            "The click was submitted; wait for its feedback.",
-            origin,
-        );
-        return;
-    }
     if running {
         cancel_token(active, &parsed.job_id).cancel(yas::cancel::StopReason::UserAbort);
     }
