@@ -1,0 +1,4 @@
+interface:
+  display_name: "GGScanner 圣遗物整理"
+  short_description: "使用 GGScanner 与 GGArtifact 扫描库存、独立配装、管理强化预算并核验游戏结果"
+  default_prompt: "使用 $ggscanner-artifact-manager 根据当前账号库存整理独立配装，并在指定预算内强化和核验。"

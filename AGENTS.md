@@ -1,5 +1,13 @@
 # Yas — Genshin Impact Scanner
 
+## AI Account Management
+
+- For user-authorized inventory scanning, artifact allocation, enhancement, forging
+  preparation, or party presets, read [Agent.md](Agent.md) and the repository's
+  [ggscanner-artifact-manager skill](skills/ggscanner-artifact-manager/SKILL.md).
+- These references do not change user budgets or authorize resource consumption.
+  Keep account exports, screenshots, and action ledgers local.
+
 ## Build Rules
 
 - When a running scanner executable locks a build output, the user authorizes stopping that scanner process before rebuilding and reopening it.

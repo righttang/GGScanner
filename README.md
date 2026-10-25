@@ -14,6 +14,13 @@
 
 本仓库是 [Anyrainel/GGScanner](https://github.com/Anyrainel/GGScanner) 的 righttang 修改版，保留上游功能与开源致谢。主要改动包括 Windows HDR 扫描修复、游戏点击及延迟 OCR 回馈、启动即提供本机服务、扫描期间查询进度与停止，以及一次授权后的本机启停入口。使用方法见 [Windows 本机控制说明](docs/WINDOWS_LOCAL_CONTROL.md) 和 [API 文档](docs/MANAGER_API.md)。
 
+## AI 整理入口
+
+让 AI 从 [Agent.md](Agent.md) 接手账号扫描与整理，或载入项目内的
+[ggscanner-artifact-manager Skill](skills/ggscanner-artifact-manager/SKILL.md)。
+Skill 包含预算与核验流程，以及支持 Windows/WSL 的 API 客户端。游戏按键支持
+WASD 短时移动、固定导航与延迟 OCR 回馈；用户的账号数据和操作台账留在本地。
+
 ## 功能
 
 - **游戏切换**：窗口顶部以等宽的“原神 / 星穹铁道”选项切换流程，并分别保留两款游戏的设置和当前页面

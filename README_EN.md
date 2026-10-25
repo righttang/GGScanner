@@ -14,6 +14,14 @@ The same `GGScannerOCR.exe` and `GGScanner.exe` serve both games. Genshin data r
 
 This is righttang's fork of [Anyrainel/GGScanner](https://github.com/Anyrainel/GGScanner), retaining upstream functionality and attribution. Changes cover Windows HDR scanning, game-window input with delayed OCR feedback, an automatically started local service, scan progress and cancellation while listening, and a one-time authorized local launcher. See [Windows local control](docs/WINDOWS_LOCAL_CONTROL.md) and the [API contract](docs/MANAGER_API.md).
 
+## AI account management
+
+Start at [Agent.md](Agent.md), or load the repository's
+[ggscanner-artifact-manager skill](skills/ggscanner-artifact-manager/SKILL.md).
+It includes budget and verification workflows plus a Windows/WSL-compatible API
+client. Game keys support short WASD movement, fixed navigation and delayed OCR.
+Keep account exports and action ledgers local.
+
 ## Features
 
 - **Game switcher**: equal-width Genshin and Star Rail choices at the top of the window; each game keeps its own settings and current page

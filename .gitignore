@@ -15,6 +15,7 @@ dumps/
 data/
 scan_output/
 scan_runs/
+ggscanner-actions/
 training_data/
 debug_images/
 debug_capture/
