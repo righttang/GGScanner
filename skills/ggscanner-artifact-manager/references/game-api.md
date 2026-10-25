@@ -8,7 +8,7 @@ Skill 后可读 [在线规范](https://github.com/righttang/GGScanner/blob/main/
 
 - `GET /health`、`GET /status`：启用、忙碌、游戏存活与分项进度。
 - `POST /scan`：如 `{"characters":true,"weapons":true,"artifacts":true}`，返回 jobId。
-- `POST /equip`、`POST /manage`：完整 GOOD 身份；外形先查权威规范。
+- `POST /equip`、`POST /manage`：使用完整 GOOD 身份；请求格式先查接口规范。
 - `GET /result?jobId=...`：该任务最终结果。
 - `GET /characters?jobId=...`、`/weapons?jobId=...`、`/artifacts?jobId=...`：扫描产物。
   分类未完成返回503，不能当成空库存。
