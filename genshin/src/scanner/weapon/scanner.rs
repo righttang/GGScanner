@@ -90,17 +90,16 @@ pub struct GoodWeaponScanner {
     ocr_regions: WeaponOcrRegions,
 }
 
-/// Additional forging material stop names not in the shared constants
-const WEAPON_FORGING_STOP_NAMES: &[&str] = &[
+/// Forging materials that should be skipped if they appear in the weapon list.
+const WEAPON_FORGING_MATERIAL_NAMES: &[&str] = &[
     "\u{7CBE}\u{953B}\u{7528}\u{9B54}\u{77FF}", // 精锻用魔矿
     "\u{7CBE}\u{953B}\u{7528}\u{826F}\u{77FF}", // 精锻用良矿
     "\u{7CBE}\u{953B}\u{7528}\u{6742}\u{77FF}", // 精锻用杂矿
 ];
 
-/// Result of scanning a single weapon: weapon data, stop signal, or skip
+/// Result of scanning a single weapon; item filters never end traversal.
 pub(crate) enum WeaponScanResult {
     Weapon(GoodWeapon),
-    Stop,
     Skip,
 }
 
@@ -158,6 +157,12 @@ impl GoodWeaponScanner {
     ) -> Result<WeaponScanResult> {
         use crate::scanner::common::debug_dump::level_cap_display;
 
+        // Low-rarity weapons can appear before eligible weapons in any sort order.
+        if pixel_utils::weapon_below_min_rarity(image, scaler, config.min_rarity) {
+            annotator::finalize_skip("below min rarity");
+            return Ok(WeaponScanResult::Skip);
+        }
+
         // OCR weapon name
         let name_text = Self::ocr_image_region(ocr, image, ocr_regions.name, scaler)?;
         let weapon_pair = fuzzy_match_map_pair(&name_text, &mappings.weapon_name_map);
@@ -175,25 +180,20 @@ impl GoodWeaponScanner {
         }
 
         if weapon_key.is_none() {
-            // Check if it's a stop-signal weapon/material
-            for &stop_name in WEAPON_STOP_NAMES
+            // Known low-tier weapons/materials are skipped, never scan boundaries.
+            for &skip_name in WEAPON_SKIP_NAMES
                 .iter()
-                .chain(WEAPON_FORGING_STOP_NAMES.iter())
+                .chain(WEAPON_FORGING_MATERIAL_NAMES.iter())
             {
-                if name_text.contains(stop_name) {
+                if name_text.contains(skip_name) {
                     log_info!(
-                        "[weapon] 检测到「{}」，停止扫描",
-                        "[weapon] detected 「{}」, stopping",
-                        stop_name
+                        "[weapon] 检测到「{}」，跳过",
+                        "[weapon] detected 「{}」, skipping",
+                        skip_name
                     );
-                    annotator::finalize_skip(&format!("stop signal: {}", stop_name));
-                    return Ok(WeaponScanResult::Stop);
+                    annotator::finalize_skip(&format!("unsupported item: {}", skip_name));
+                    return Ok(WeaponScanResult::Skip);
                 }
-            }
-
-            if pixel_utils::weapon_below_min_rarity(image, scaler, config.min_rarity) {
-                annotator::finalize_skip("below min rarity");
-                return Ok(WeaponScanResult::Stop);
             }
 
             if config.continue_on_failure {
@@ -634,10 +634,6 @@ impl GoodWeaponScanner {
                                 Ok(None)
                             }
                         },
-                        Ok(WeaponScanResult::Stop) => {
-                            annotator::finalize_skip("stop signal");
-                            Ok(None)
-                        },
                         Ok(WeaponScanResult::Skip) => Ok(None),
                         Err(e) => {
                             annotator::finalize_error(None, &e.to_string());
@@ -690,7 +686,7 @@ impl GoodWeaponScanner {
             Ok(())
         };
 
-        bp.scan_grid(total, &scan_config, start_at, |ctrl, event| match event {
+        bp.scan_grid(total, &scan_config, start_at, |_, event| match event {
             GridEvent::PageStarted { .. } => ScanAction::Continue,
             GridEvent::PageCompleted { .. } => {
                 if worker_handle.stop_requested() {
@@ -713,16 +709,6 @@ impl GoodWeaponScanner {
                 }
                 if let Some(pf) = progress_fn {
                     pf(idx + 1, total, "", "");
-                }
-                if pixel_utils::weapon_below_min_rarity(
-                    &frame.image,
-                    &scaler,
-                    self.config.min_rarity,
-                ) {
-                    voter.finish_additional_passes(&scaler, || ctrl.capture_game().ok());
-                    let ready = voter.early_stop_flush();
-                    let _ = emit_ready(ready, &item_tx);
-                    return ScanAction::Stop;
                 }
                 let ready = voter.record_with_layout(
                     idx,
@@ -895,6 +881,7 @@ impl GoodWeaponScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::common::capture_frame::CaptureFrame;
     use crate::scanner::common::test_utils::*;
 
     fn default_config() -> GoodWeaponScannerConfig {
@@ -967,22 +954,69 @@ mod tests {
     }
 
     #[test]
-    fn test_weapon_low_rarity_stops() {
-        let mut image = make_1080p_image();
-        paint_rarity_stars(&mut image, 2);
-        let scaler = make_1080p_scaler();
-        let regions = WeaponOcrRegions::new();
-        let mappings = make_test_mappings();
-        let config = default_config();
+    fn low_rarity_weapons_skip_before_name_ocr() {
+        for min_rarity in [3, 5] {
+            for rarity in 1..min_rarity {
+                let image = make_weapon_image(rarity, false);
+                let ocr = FakeOcr::new(vec![]);
+                let config = GoodWeaponScannerConfig {
+                    min_rarity,
+                    ..default_config()
+                };
+                let result = GoodWeaponScanner::scan_single_weapon(
+                    &ocr,
+                    None,
+                    &image,
+                    &make_1080p_scaler(),
+                    &WeaponOcrRegions::new(),
+                    &make_test_mappings(),
+                    &config,
+                    0,
+                    None,
+                )
+                .unwrap();
+                assert!(matches!(result, WeaponScanResult::Skip));
+                assert_eq!(ocr.call_count(), 0);
+            }
+        }
+    }
 
-        let ocr = FakeOcr::new(vec!["something"]);
-
-        let result = GoodWeaponScanner::scan_single_weapon(
-            &ocr, None, &image, &scaler, &regions, &mappings, &config, 0, None,
-        )
-        .unwrap();
-
-        assert!(matches!(result, WeaponScanResult::Stop));
+    #[test]
+    fn mixed_rarity_weapons_retain_later_items_and_scan_indices() {
+        let (sender, worker) = scan_worker::start_worker(true, |item: WorkItem<()>| {
+            let ocr = FakeOcr::new(vec!["天空之翼", "90/90", "精炼1阶", ""]);
+            match GoodWeaponScanner::scan_single_weapon(
+                &ocr,
+                None,
+                &item.frame.image,
+                &make_1080p_scaler(),
+                &WeaponOcrRegions::new(),
+                &make_test_mappings(),
+                &default_config(),
+                item.index,
+                None,
+            )? {
+                WeaponScanResult::Weapon(weapon) => Ok(Some(weapon)),
+                WeaponScanResult::Skip => Ok(None),
+            }
+        });
+        for (index, rarity) in [2, 5, 1, 5, 2].into_iter().enumerate() {
+            sender
+                .send(WorkItem {
+                    index,
+                    frame: CaptureFrame::full(make_weapon_image(rarity, false)),
+                    metadata: (),
+                    grid_annotation: None,
+                })
+                .unwrap();
+        }
+        drop(sender);
+        let (weapons, indices) = worker
+            .join(|_| panic!("low rarity is not an OCR failure"))
+            .unwrap();
+        assert_eq!(indices, [1, 3]);
+        assert_eq!(weapons.len(), 2);
+        assert!(weapons.iter().all(|weapon| weapon.key == "SkywardHarp"));
     }
 
     #[test]

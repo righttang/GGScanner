@@ -18,7 +18,7 @@ The constellation icons and talent levels have fixed position on the screen, and
 
 For weapons, we need to read from the detail card on the right:
 - name (str), possibly weapon type for validation
-- rarity (3-5), star pixel detection to help with stopping condition (ignore 1-2 rarity weapons)
+- rarity (3-5), star pixel detection filters individual items (skip 1-2 rarity weapons without ending traversal)
 - level (1-90), level cap (10,20,...,90)
 - refinement (1-5)
 - lock status, pixel detection from lock icon
@@ -32,7 +32,7 @@ All weapon fields are displayed on fixed positions, except name for weapon and c
 For artifacts, we need to read from the detail card on the right:
 - slot name (生之花、死之羽、时之沙、空之杯、理之冠)w
 - main stat key
-- rarity (4-5), star pixel detection to help with filtering stopping condition
+- rarity (4-5), star pixel detection filters individual items and never ends traversal
 - level (0-20 at rarity 5, 0-16 at rarity 4)
 - lock status, pixel detection
 - astral mark, pixel detection

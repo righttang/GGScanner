@@ -44,4 +44,35 @@ class ClientTests(unittest.TestCase):
                 client.mutate('http://localhost:18765','/input/key',{'key':'w'},directory)
             self.assertEqual(list(Path(directory).iterdir()),[]);call.assert_not_called()
 
+    def test_temporary_receipt_file_lock_does_not_repeat_the_post(self):
+        original_replace = Path.replace
+        replacements = 0
+        def sometimes_locked(staged, target):
+            nonlocal replacements
+            replacements += 1
+            # The request ledger succeeds, but the response ledger is briefly locked.
+            if replacements in (2, 3):raise PermissionError('file is open')
+            return original_replace(staged, target)
+        body={'requestId':'one-post','key':'menu','holdMs':80}
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(Path,'replace',autospec=True,side_effect=sometimes_locked), \
+                    patch.object(client.time,'sleep') as sleep, \
+                    patch.object(client,'transport',return_value=(202,{'jobId':'one-post'})) as call:
+                client.mutate('http://localhost:18765','/input/key',body,directory)
+            call.assert_called_once()
+            self.assertEqual(sleep.call_count,2)
+            receipt=Path(directory)/'one-post.json'
+            self.assertEqual(json.loads(receipt.read_text())['state'],'response_received')
+            self.assertEqual(list(Path(directory).iterdir()),[receipt])
+
+    def test_a_persistent_initial_ledger_lock_prevents_the_post(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(Path,'replace',side_effect=PermissionError('file stays locked')) as replace, \
+                patch.object(client.time,'sleep'),patch.object(client,'transport') as call:
+            with self.assertRaises(PermissionError):
+                client.mutate('http://localhost:18765','/input/key',{'requestId':'blocked','key':'menu'},directory)
+            self.assertEqual(replace.call_count,20)
+            call.assert_not_called()
+            self.assertEqual(list(Path(directory).iterdir()),[])
+
 if __name__=='__main__':unittest.main()

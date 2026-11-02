@@ -16,12 +16,14 @@ description: Use GGScanner and GGArtifact to scan Genshin inventory, plan indepe
 
 先查 `/health`、`/status`。默认端口18765；WSL访问Windows用 `curl.exe`。
 Windows HDR与扫描设置一致。启停见仓库 `docs/WINDOWS_LOCAL_CONTROL.md`；
-不要自行安装管理员入口。
+不要自行安装管理员入口。项目API已覆盖的操作直接调用接口；先查规范和客户端，
+不因Scanner已有窗口就改用Computer Use。
 
 ## 流程与资源
 
 - 扫描、独立分配、培养和核验：读 [inventory-workflow.md](references/inventory-workflow.md)。
 - 接口、去重、移动与现场：读 [game-api.md](references/game-api.md)。
+- 体力与后续培养建议：读 [resin-planning.md](references/resin-planning.md)。
 - [ggscanner_client.py](scripts/ggscanner_client.py) 在POST前保存请求及结果；
   `--dry-run`不操作游戏，`--help`提供示例。
 
@@ -37,7 +39,8 @@ Windows HDR与扫描设置一致。启停见仓库 `docs/WINDOWS_LOCAL_CONTROL.m
    反应触发与实际命座均须考虑。网站分配只是计划，不能替代游戏执行回执。
 5. 移动从短按开始，确认传送位置与交互提示；时长不是精确距离。结束自动松键，
    焦点丢失或中断后先观察，不盲目连发。
-6. 旧配装和队伍先备份，完成后核验实际持有人、成员顺序及队名。预设复用角色
+6. 旧配装和队伍先备份，完成后核验实际持有人、成员顺序及队名。找到物品或提交
+   点击不等于归属已变更；筛选后重新确认选中物品。预设复用角色
    不代表允许共用装备；超过游戏容量的额外方案另存。
 
 ## 交付

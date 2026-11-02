@@ -90,7 +90,7 @@ GGScannerOCR.exe --characters --weapons  # Combine targets
 - Genshin scanning supports the **Simplified Chinese** client; Star Rail recognizes English and Chinese UI labels
 - **16:9 resolution** recommended (1920x1080, 2560x1440, etc.)
 - Do not move the mouse during scanning
-- Artifacts below 4-star are skipped by default (adjustable via `--artifact-min-rarity`)
+- Artifacts below 4-star are skipped by default (adjustable via `--artifact-min-rarity`), while scanning continues through later items. Low rarity never marks the end of the inventory; weapons follow the same rule.
 
 ## Linux support (experimental)
 

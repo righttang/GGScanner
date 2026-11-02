@@ -4,6 +4,7 @@ use std::sync::Arc;
 use image::RgbImage;
 use yas::{log_debug, log_info, log_warn};
 
+use crate::scanner::common::character_name::{clean_char_name, resolve_character_name};
 use crate::scanner::common::constants::*;
 use crate::scanner::common::coord_scaler::CoordScaler;
 use crate::scanner::common::debug_dump::DumpCtx;
@@ -15,7 +16,7 @@ use yas::ocr::ImageToText;
 
 use super::models::*;
 use super::ui_actions;
-use super::ui_actions::{d_action, d_cell, d_transition};
+use super::ui_actions::{d_action, d_cell, d_transition, SEL_ACTION_BUTTON_RECT};
 
 /// A single equip/unequip target with a result ID for tracking.
 pub struct EquipTarget {
@@ -232,9 +233,7 @@ impl EquipManager {
             }
 
             // Try to match this character against any remaining char_groups
-            let clean_name = clean_char_name(&name_trimmed);
-            let matched_key =
-                self.match_character_name(&name_trimmed, &clean_name, char_groups, results);
+            let matched_key = self.match_character_name(&name_trimmed, char_groups, results);
 
             if let Some(char_key) = matched_key {
                 log_debug!(
@@ -289,56 +288,19 @@ impl EquipManager {
         report(results.len(), "");
     }
 
-    /// Try to match the OCR'd character name against any of the target character keys.
+    /// Resolve against every known character before checking pending targets.
     fn match_character_name(
         &self,
-        name_trimmed: &str,
-        clean_name: &str,
+        name: &str,
         char_groups: &HashMap<&str, Vec<&EquipTarget>>,
         results: &HashMap<String, InstructionResult>,
     ) -> Option<String> {
-        for &char_key in char_groups.keys() {
-            // Skip characters that are already fully processed
-            let has_remaining = char_groups[char_key]
-                .iter()
-                .any(|t| !results.contains_key(&t.result_id));
-            if !has_remaining {
-                continue;
-            }
-
-            // Direct GOOD key match
-            if name_trimmed.contains(char_key) {
-                return Some(char_key.to_string());
-            }
-
-            // Chinese name match
-            let cn_names: Vec<String> = self
-                .mappings
-                .character_name_map
-                .iter()
-                .filter(|(_, v)| v.as_str() == char_key)
-                .map(|(k, _)| k.clone())
-                .collect();
-
-            for cn in &cn_names {
-                if name_trimmed.contains(cn.as_str()) {
-                    return Some(char_key.to_string());
-                }
-                if fuzzy_char_match(clean_name, cn) {
-                    return Some(char_key.to_string());
-                }
-            }
-
-            // Reverse mapping lookup
-            for try_name in &[name_trimmed, clean_name] {
-                if let Some(matched_key) = self.mappings.character_name_map.get(*try_name) {
-                    if matched_key.as_str() == char_key {
-                        return Some(char_key.to_string());
-                    }
-                }
-            }
-        }
-        None
+        let key = resolve_character_name(name, &self.mappings.character_name_map)?;
+        char_groups
+            .get(key.as_str())?
+            .iter()
+            .any(|t| !results.contains_key(&t.result_id))
+            .then_some(key)
     }
 
     /// Process all equip targets for one character, using smart set-based slot ordering.
@@ -457,120 +419,37 @@ impl EquipManager {
                 continue;
             }
 
-            // Check if the currently equipped artifact already matches (live OCR check)
-            match ui_actions::check_current_artifact_matches(
+            // Selection/filter changes may select an unowned piece. Finding it
+            // and clicking a button do not prove the requested ownership.
+            let found = match ui_actions::check_current_artifact_matches(
                 ctrl,
                 &target.artifact,
                 ocr,
                 &self.mappings,
             ) {
+                Ok(true) => Ok(true),
+                _ => ui_actions::find_artifact_in_grid_with_dump(
+                    ctrl,
+                    &target.artifact,
+                    ocr,
+                    &self.mappings,
+                    false,
+                    self.dump_images,
+                ),
+            };
+            match found {
                 Ok(true) => {
-                    let owner_key =
-                        match ui_actions::read_selected_artifact_owner(ctrl, ocr, &self.mappings) {
-                            Ok((_raw_text, owner_key)) => owner_key,
-                            Err(e) => {
-                                log_debug!(
-                                    "[equip_slot] 读取当前圣遗物归属失败: {}",
-                                    "[equip_slot] read selected artifact owner failed: {}",
-                                    e
-                                );
-                                String::new()
-                            },
-                        };
-
-                    if owner_key == target.target_location {
-                        log_info!(
-                            "[equip_slot] {} 已正确装备",
-                            "[equip_slot] {} already correct",
-                            target.result_id
-                        );
-                        results.insert(
+                    let result = match self.equip_selected_target(ctrl, target, ocr) {
+                        Ok(status) => InstructionResult::outcome(target.result_id.clone(), status),
+                        Err(e) => InstructionResult::failure(
                             target.result_id.clone(),
-                            InstructionResult::outcome(
-                                target.result_id.clone(),
-                                InstructionStatus::AlreadyCorrect,
-                            ),
-                        );
-                        continue;
-                    }
-
-                    log_info!(
-                        "[equip_slot] {} 匹配当前选中圣遗物，但归属='{}'，直接装备",
-                        "[equip_slot] {} matches selected artifact but owner='{}'; equipping it",
-                        target.result_id,
-                        owner_key
-                    );
-                    match ui_actions::equip_selected_artifact(ctrl, ocr, "check_current") {
-                        Ok(true) => {
-                            results.insert(
-                                target.result_id.clone(),
-                                InstructionResult::outcome(
-                                    target.result_id.clone(),
-                                    InstructionStatus::Success,
-                                ),
-                            );
-                        },
-                        Ok(false) => {
-                            results.insert(
-                                target.result_id.clone(),
-                                InstructionResult::outcome(
-                                    target.result_id.clone(),
-                                    InstructionStatus::AlreadyCorrect,
-                                ),
-                            );
-                        },
-                        Err(e) => {
-                            log_warn!(
-                                "[equip_slot] 装备当前选中圣遗物失败: {}",
-                                "[equip_slot] equip selected artifact failed: {}",
-                                e
-                            );
-                            results.insert(
-                                target.result_id.clone(),
-                                InstructionResult::failure(
-                                    target.result_id.clone(),
-                                    InstructionStatus::UiError,
-                                    "找到了目标圣遗物，但游戏中的装备操作失败。",
-                                    "The target artifact was found, but the in-game equip action failed.",
-                                    Some(&e),
-                                ),
-                            );
-                        },
-                    }
-                    continue;
-                },
-                Ok(false) => { /* need to find the artifact */ },
-                Err(e) => {
-                    log_debug!(
-                        "[equip_slot] 检查当前圣遗物失败: {}",
-                        "[equip_slot] check current failed: {}",
-                        e
-                    );
-                },
-            }
-
-            // Search the grid for the target artifact
-            match ui_actions::find_artifact_in_grid_with_dump(
-                ctrl,
-                &target.artifact,
-                ocr,
-                &self.mappings,
-                true,
-                self.dump_images,
-            ) {
-                Ok(true) => {
-                    log_info!(
-                        "[equip_slot] 装备成功: {}",
-                        "[equip_slot] equip success: {}",
-                        target.result_id
-                    );
-                    results.insert(
-                        target.result_id.clone(),
-                        InstructionResult::outcome(
-                            target.result_id.clone(),
-                            InstructionStatus::Success,
+                            InstructionStatus::UiError,
+                            "找到了目标圣遗物，但未能确认它已由目标角色装备。请检查实际归属后再继续。",
+                            "The target artifact was found, but its requested owner could not be confirmed. Check its actual owner before continuing.",
+                            Some(&e),
                         ),
-                    );
+                    };
+                    results.insert(target.result_id.clone(), result);
                 },
                 Ok(false) => {
                     log_warn!(
@@ -614,6 +493,46 @@ impl EquipManager {
         yas::utils::sleep(d_action());
     }
 
+    fn equip_selected_target(
+        &self,
+        ctrl: &mut GenshinGameController,
+        target: &EquipTarget,
+        ocr: &dyn ImageToText<RgbImage>,
+    ) -> anyhow::Result<InstructionStatus> {
+        // Re-read after reselecting a grid match, before any mutation.
+        anyhow::ensure!(
+            ui_actions::check_current_artifact_matches(
+                ctrl,
+                &target.artifact,
+                ocr,
+                &self.mappings
+            )?,
+            "selected artifact identity changed before equip"
+        );
+        let (_, owner) = ui_actions::read_selected_artifact_owner(ctrl, ocr, &self.mappings)?;
+        if owner == target.target_location {
+            return confirmed_equip_status(false, &owner, &target.target_location);
+        }
+        let clicked = ui_actions::equip_selected_artifact(ctrl, ocr, "equip_selected")?;
+        // Observe at most twice to allow a late owner-label transition. Never
+        // repeat the input when its result is uncertain.
+        let (_, mut owner) = ui_actions::read_selected_artifact_owner(ctrl, ocr, &self.mappings)?;
+        if owner != target.target_location {
+            yas::utils::sleep(d_cell() * 2);
+            owner = ui_actions::read_selected_artifact_owner(ctrl, ocr, &self.mappings)?.1;
+        }
+        anyhow::ensure!(
+            ui_actions::check_current_artifact_matches(
+                ctrl,
+                &target.artifact,
+                ocr,
+                &self.mappings
+            )?,
+            "selected artifact identity changed after equip"
+        );
+        confirmed_equip_status(clicked, &owner, &target.target_location)
+    }
+
     fn do_unequip(
         &self,
         ctrl: &mut GenshinGameController,
@@ -652,7 +571,31 @@ impl EquipManager {
             );
         }
 
-        if let Err(e) = ui_actions::click_unequip_button(ctrl) {
+        let selected = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                ui_actions::check_current_artifact_matches(
+                    ctrl,
+                    &target.artifact,
+                    ocr,
+                    &self.mappings
+                )?,
+                "selected artifact identity does not match the unequip request"
+            );
+            let (_, owner) = ui_actions::read_selected_artifact_owner(ctrl, ocr, &self.mappings)?;
+            confirmed_equip_status(false, &owner, current_owner)?;
+            Ok(())
+        })();
+        if let Err(e) = selected {
+            return InstructionResult::failure(
+                target.result_id.clone(),
+                InstructionStatus::UiError,
+                "未能确认当前圣遗物及持有者，未执行卸下操作。",
+                "The selected artifact and owner could not be confirmed; nothing was unequipped.",
+                Some(&e),
+            );
+        }
+
+        if let Err(e) = ui_actions::click_unequip_button(ctrl, ocr) {
             log_warn!(
                 "[equip_manager] 卸下操作失败: {}",
                 "[equip_manager] unequip failed: {}",
@@ -663,6 +606,38 @@ impl EquipManager {
                 InstructionStatus::UiError,
                 "游戏中的卸下操作失败。请确认角色界面没有被其他弹窗遮挡。",
                 "The in-game unequip action failed. Check that no other dialog is covering the character screen.",
+                Some(&e),
+            );
+        }
+
+        let verification = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                ui_actions::check_current_artifact_matches(
+                    ctrl,
+                    &target.artifact,
+                    ocr,
+                    &self.mappings
+                )?,
+                "selected artifact identity changed after unequip"
+            );
+            let (raw_owner, owner) =
+                ui_actions::read_selected_artifact_owner(ctrl, ocr, &self.mappings)?;
+            let button = ctrl.ocr_region(ocr, SEL_ACTION_BUTTON_RECT)?;
+            anyhow::ensure!(
+                raw_owner.trim().is_empty()
+                    && owner.is_empty()
+                    && button.contains("装")
+                    && !button.contains("卸")
+                    && !button.contains("替"),
+                "unequip outcome was not confirmed: owner={raw_owner:?}, button={button:?}"
+            );
+            Ok(())
+        })();
+        if let Err(e) = verification {
+            return InstructionResult::failure(
+                target.result_id.clone(), InstructionStatus::UiError,
+                "已提交卸下操作，但未能确认实际结果。请检查当前圣遗物归属。",
+                "The unequip action was submitted, but its outcome could not be confirmed. Check the artifact's actual owner.",
                 Some(&e),
             );
         }
@@ -723,53 +698,47 @@ fn analyze_set_composition(targets: &[&EquipTarget]) -> (Vec<usize>, Vec<String>
     (flex_indices, main_sets)
 }
 
-// Re-export helper functions from ui_actions module scope
-fn clean_char_name(text: &str) -> String {
-    let name = extract_char_name(text);
-    let chars: Vec<char> = name.chars().collect();
-    let mut end = chars.len();
-    while end > 0 {
-        let c = chars[end - 1];
-        if c >= '\u{4e00}' && c <= '\u{9fff}' {
-            break;
-        }
-        if c >= '\u{3040}' && c <= '\u{30ff}' {
-            break;
-        }
-        end -= 1;
-    }
-    chars[..end].iter().collect()
+/// A successful click is insufficient: the selected item must have the exact
+/// requested owner. This also rejects an unreadable owner or an unequip button
+/// encountered on the wrong character.
+fn confirmed_equip_status(
+    clicked: bool,
+    owner: &str,
+    expected: &str,
+) -> anyhow::Result<InstructionStatus> {
+    anyhow::ensure!(
+        !expected.is_empty() && owner == expected,
+        "requested artifact owner was not confirmed: expected={expected:?}, observed={owner:?}"
+    );
+    Ok(if clicked {
+        InstructionStatus::Success
+    } else {
+        InstructionStatus::AlreadyCorrect
+    })
 }
 
-fn extract_char_name(text: &str) -> String {
-    let trimmed = text.trim();
-    for sep in &['/', '／', '丨', '|'] {
-        if let Some(pos) = trimmed.rfind(*sep) {
-            let after = &trimmed[pos + sep.len_utf8()..].trim();
-            if !after.is_empty() {
-                return after.to_string();
-            }
-        }
-    }
-    if let Some(pos) = trimmed.rfind("元素") {
-        let after = &trimmed[pos + "元素".len()..].trim();
-        if !after.is_empty() {
-            return after.to_string();
-        }
-    }
-    trimmed.to_string()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn fuzzy_char_match(ocr_name: &str, expected: &str) -> bool {
-    let ocr_chars: Vec<char> = ocr_name.chars().collect();
-    let exp_chars: Vec<char> = expected.chars().collect();
-    if ocr_chars.len() != exp_chars.len() || ocr_chars.len() < 2 {
-        return false;
+    #[test]
+    fn clicked_equip_is_successful_only_after_requested_owner_is_seen() {
+        assert_eq!(
+            confirmed_equip_status(true, "Xianyun", "Xianyun").unwrap(),
+            InstructionStatus::Success
+        );
+        assert!(confirmed_equip_status(true, "Chongyun", "Xianyun").is_err());
+        assert!(confirmed_equip_status(true, "", "Xianyun").is_err());
     }
-    let diffs = ocr_chars
-        .iter()
-        .zip(exp_chars.iter())
-        .filter(|(a, b)| a != b)
-        .count();
-    diffs <= 1
+
+    #[test]
+    fn an_unequip_button_is_not_proof_of_the_requested_owner() {
+        assert_eq!(
+            confirmed_equip_status(false, "Xianyun", "Xianyun").unwrap(),
+            InstructionStatus::AlreadyCorrect
+        );
+        assert!(confirmed_equip_status(false, "Chongyun", "Xianyun").is_err());
+        assert!(confirmed_equip_status(false, "", "Xianyun").is_err());
+        assert!(confirmed_equip_status(false, "", "").is_err());
+    }
 }

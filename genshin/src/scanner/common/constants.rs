@@ -1,9 +1,8 @@
 /// Elixir (祝圣) Y-offset in pixels (at 1920x1080 base)
 pub const ELIXIR_SHIFT: f64 = 40.0;
 
-/// Low-tier weapon names that signal we've reached the end of useful weapons.
-/// When these are detected, the weapon scanner stops.
-pub const WEAPON_STOP_NAMES: &[&str] = &[
+/// Unsupported low-tier weapon names to skip without ending inventory traversal.
+pub const WEAPON_SKIP_NAMES: &[&str] = &[
     "\u{5386}\u{7EC3}\u{7684}\u{730E}\u{5F13}", // 历练的猎弓
     "\u{53E3}\u{888B}\u{9B54}\u{5BFC}\u{4E66}", // 口袋魔导书
     "\u{94C1}\u{5C16}\u{67AA}",                 // 铁尖枪

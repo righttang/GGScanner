@@ -34,12 +34,11 @@ use super::ui_actions;
 /// Single-pass artifact backpack scan with per-page lock toggling.
 ///
 /// Accepts `LockTarget` slices from the orchestrator. Each target specifies
-/// an artifact to match and the desired lock state. Rarity early-stop:
-/// when a scanned artifact has rarity < 4, the current page is finished
-/// but no further items are dispatched.
+/// an artifact to match and the desired lock state. Artifacts below 4 stars
+/// are skipped without ending traversal, regardless of inventory order.
 ///
 /// 单次遍历圣遗物背包，每页扫描后直接切换锁定。
-/// 当检测到稀有度 < 4 时，完成当前页后停止扫描。
+/// 稀有度 < 4 的圣遗物只跳过，不停止扫描。
 pub struct LockManager {
     mappings: Arc<MappingManager>,
     pools: Arc<SharedOcrPools>,
@@ -144,17 +143,6 @@ fn set_filter_plan(requested_count: usize, selected_count: usize) -> SetFilterPl
     }
 }
 
-fn should_stop_at_rarity_boundary(below_min_rarity: bool, level: i32) -> bool {
-    // scan_level_only uses -1 as its OCR-failure sentinel. Only a confirmed
-    // level 0 item proves that the sorted >=4-star section has ended.
-    below_min_rarity && level == 0
-}
-
-fn repeated_rarity_below_min(first: Option<i32>, second: Option<i32>, min_rarity: i32) -> bool {
-    first.is_some_and(|rarity| rarity < min_rarity)
-        && second.is_some_and(|rarity| rarity < min_rarity)
-}
-
 fn visual_end_floor(observed_count: usize, filter_applied: bool) -> usize {
     // After a set filter is applied, the header continues to show the
     // unfiltered inventory count. It is not a lower bound for the visible
@@ -168,7 +156,6 @@ fn visual_end_floor(observed_count: usize, filter_applied: bool) -> usize {
 
 fn scan_proves_absence(
     termination: ScanTermination,
-    rarity_stopped: bool,
     missed_count: usize,
     skipped_count: usize,
     identity_failure_count: usize,
@@ -181,7 +168,8 @@ fn scan_proves_absence(
         && skipped_count == 0
         && identity_failure_count == 0
         && !filtered_or_uncertain
-        && (rarity_stopped || (reached_observed_count && termination == ScanTermination::EmptyCell))
+        && reached_observed_count
+        && termination == ScanTermination::EmptyCell
 }
 
 fn decide_confirmed_lock_action(
@@ -216,7 +204,8 @@ fn update_scanned_lock_state(
 /// Panel pool rect for wait_until_panel_loaded (same as backpack_scanner).
 const PANEL_POOL_RECT: (f64, f64, f64, f64) = (1330.0, 478.0, 370.0, 187.0);
 
-type OcrResult = (usize, usize, usize, Option<GoodArtifact>);
+// Ok(None) is an intentional rarity skip; Err(()) is an identity failure.
+type OcrResult = (usize, usize, usize, Result<Option<GoodArtifact>, ()>);
 
 fn spawn_identify_artifact_task(
     idx: usize,
@@ -239,6 +228,12 @@ fn spawn_identify_artifact_task(
             annotator::record_grid_overlay(ann.0.clone(), ann.1.clone());
         }
 
+        if pixel_utils::artifact_below_min_rarity(&frame, &scaler, 4) {
+            annotator::finalize_skip("below min rarity");
+            let _ = tx.send((idx, row, col, Ok(None)));
+            return;
+        }
+
         let ocr = ocr_pool.get();
         let sub_ocr = substat_pool.get();
         let artifact = match GoodArtifactScanner::identify_artifact_at(
@@ -250,7 +245,8 @@ fn spawn_identify_artifact_task(
             idx,
             grid_icons,
         ) {
-            Ok(a) => a,
+            Ok(Some(artifact)) => Ok(Some(artifact)),
+            Ok(None) => Err(()),
             Err(e) => {
                 log_warn!(
                     "[lock_manager] OCR失败 #{}: {}",
@@ -259,7 +255,7 @@ fn spawn_identify_artifact_task(
                     e
                 );
                 annotator::finalize_error(None, &e.to_string());
-                None
+                Err(())
             },
         };
         let _ = tx.send((idx, row, col, artifact));
@@ -577,7 +573,6 @@ impl LockManager {
             PagedGridVoter::new(total, GridMode::Artifact);
 
         // Scan-wide flags.
-        let mut rarity_stopped = false;
         let mut stop_requested = false;
         let mut lock_action_counter: usize = 0;
         // Once the last-cell probe shows a level within range (or OCR succeeds
@@ -704,71 +699,6 @@ impl LockManager {
                         }
                     };
 
-                    // Rarity early-stop: low-rarity lv0 artifact → stop after
-                    // current page finishes (PageCompleted will drain and
-                    // process toggles for whatever was dispatched so far).
-                    let first_rarity = pixel_utils::detect_artifact_rarity_evidence(
-                        &frame,
-                        &scaler_cb,
-                    );
-                    let mut settled_frame = None;
-                    let below_min_rarity = if first_rarity.is_some_and(|rarity| rarity < 4) {
-                        // The star row is outside the fast panel fingerprint.
-                        // Confirm the same low-rarity geometry in a later full
-                        // capture so a partially rendered 4/5-star row cannot
-                        // become an authoritative inventory boundary.
-                        yas::utils::sleep(100);
-                        match ctrl_cb.capture_game() {
-                            Ok(image) => {
-                                let second_frame = CaptureFrame::full(image);
-                                let second_rarity = pixel_utils::detect_artifact_rarity_evidence(
-                                    &second_frame,
-                                    &scaler_cb,
-                                );
-                                let confirmed =
-                                    repeated_rarity_below_min(first_rarity, second_rarity, 4);
-                                settled_frame = Some(second_frame);
-                                confirmed
-                            },
-                            Err(e) => {
-                                log_warn!(
-                                    "[lock_manager] 无法复核低稀有度外观，将继续扫描: {}",
-                                    "[lock_manager] Could not confirm the low-rarity appearance; continuing the scan: {}",
-                                    e
-                                );
-                                false
-                            },
-                        }
-                    } else {
-                        false
-                    };
-                    let evidence_frame = settled_frame.as_ref().unwrap_or(&frame);
-                    let boundary_level = if below_min_rarity {
-                        let guard = ocr_pool_cb.get();
-                        GoodArtifactScanner::scan_level_only(&guard, evidence_frame, &scaler_cb)
-                    } else {
-                        -1
-                    };
-                    if should_stop_at_rarity_boundary(below_min_rarity, boundary_level) {
-                        log_debug!(
-                            "[lock_manager] 检测到低稀有度lv0圣遗物，当前页后停止",
-                            "[lock_manager] Low rarity lv0 artifact detected, stopping after current page"
-                        );
-                        rarity_stopped = true;
-                        stop_requested = true;
-                        voter.finish_additional_passes(&scaler_cb, || ctrl_cb.capture_game().ok());
-                        let ready = voter.early_stop_flush();
-                        dispatch(ready, &mut dispatched);
-                        return ScanAction::Stop;
-                    }
-                    if below_min_rarity && boundary_level < 0 {
-                        log_warn!(
-                            "[lock_manager] 检测到低稀有度外观，但等级OCR失败；无法确认边界，将继续扫描",
-                            "[lock_manager] The item looked low-rarity but level OCR failed; the inventory boundary is unconfirmed, continuing the scan"
-                        );
-                    }
-
-                    let frame = settled_frame.unwrap_or(frame);
                     let ready = voter.record_with_layout(
                         idx,
                         frame,
@@ -833,7 +763,7 @@ impl LockManager {
                     // manager toggles or reports AlreadyCorrect.
                     let mut page_actions: Vec<PageLockAction> = Vec::new();
                     for (idx, row, col, artifact_opt) in &page_results {
-                        if let Some(ref artifact) = artifact_opt {
+                        if let Ok(Some(ref artifact)) = artifact_opt {
                             scanned_artifacts.push((*idx, artifact.clone()));
 
                             let unmatched: Vec<(usize, &GoodArtifact)> = targets.iter()
@@ -858,7 +788,7 @@ impl LockManager {
                                     y_shift,
                                 });
                             }
-                        } else {
+                        } else if artifact_opt.is_err() {
                             ocr_failures += 1;
                         }
                     }
@@ -1132,13 +1062,10 @@ impl LockManager {
             identity_failures
         );
 
-        // Compute scan completeness from traversal, rather than the last OCR
-        // success. Rarity early-stop counts as complete because a confirmed
-        // low-rarity level-0 item is the logical end of the managed >=4★
-        // section. Fast mode remains partial because it may skip pages.
+        // Only complete traversal proves absence. A low-rarity item is not
+        // evidence that later items cannot match. Fast mode remains partial.
         let absence_confirmed = scan_proves_absence(
             scan_outcome.termination,
-            rarity_stopped,
             scan_outcome.missed_count,
             scan_outcome.skipped_count,
             identity_failures,
@@ -1273,23 +1200,10 @@ mod tests {
     }
 
     #[test]
-    fn rarity_boundary_requires_a_confirmed_level_zero() {
-        assert!(should_stop_at_rarity_boundary(true, 0));
-        assert!(!should_stop_at_rarity_boundary(true, -1));
-        assert!(!should_stop_at_rarity_boundary(true, 1));
-        assert!(!should_stop_at_rarity_boundary(false, 0));
-
-        assert!(repeated_rarity_below_min(Some(3), Some(3), 4));
-        assert!(!repeated_rarity_below_min(Some(3), Some(4), 4));
-        assert!(!repeated_rarity_below_min(Some(3), None, 4));
-    }
-
-    #[test]
     fn only_complete_and_reliable_scan_evidence_proves_target_absence() {
         // Reaching an OCR-derived traversal limit alone is never authoritative.
         assert!(!scan_proves_absence(
             ScanTermination::Exhausted,
-            false,
             0,
             0,
             0,
@@ -1297,19 +1211,17 @@ mod tests {
             200,
             false,
         ));
-        assert!(scan_proves_absence(
+        assert!(!scan_proves_absence(
             ScanTermination::CallbackStop,
-            true,
             0,
             0,
             0,
-            0,
+            200,
             200,
             false,
         ));
         assert!(scan_proves_absence(
             ScanTermination::EmptyCell,
-            false,
             0,
             0,
             0,
@@ -1321,7 +1233,6 @@ mod tests {
         // proof that unresolved targets do not exist.
         assert!(!scan_proves_absence(
             ScanTermination::UnchangedPage,
-            false,
             0,
             0,
             0,
@@ -1331,7 +1242,6 @@ mod tests {
         ));
         assert!(!scan_proves_absence(
             ScanTermination::UnchangedPage,
-            false,
             0,
             0,
             0,
@@ -1341,7 +1251,6 @@ mod tests {
         ));
         assert!(!scan_proves_absence(
             ScanTermination::EmptyCell,
-            false,
             0,
             0,
             0,
@@ -1351,7 +1260,6 @@ mod tests {
         ));
         assert!(!scan_proves_absence(
             ScanTermination::UnchangedPage,
-            false,
             0,
             0,
             0,
@@ -1361,7 +1269,6 @@ mod tests {
         ));
         assert!(!scan_proves_absence(
             ScanTermination::EmptyCell,
-            false,
             1,
             0,
             0,
@@ -1371,7 +1278,6 @@ mod tests {
         ));
         assert!(!scan_proves_absence(
             ScanTermination::EmptyCell,
-            false,
             0,
             1,
             0,
@@ -1381,7 +1287,6 @@ mod tests {
         ));
         assert!(!scan_proves_absence(
             ScanTermination::EmptyCell,
-            false,
             0,
             0,
             1,
@@ -1391,7 +1296,6 @@ mod tests {
         ));
         assert!(!scan_proves_absence(
             ScanTermination::EmptyCell,
-            false,
             0,
             0,
             0,
@@ -1401,7 +1305,6 @@ mod tests {
         ));
         assert!(!scan_proves_absence(
             ScanTermination::CaptureFailure,
-            false,
             1,
             0,
             0,

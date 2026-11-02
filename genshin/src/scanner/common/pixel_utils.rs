@@ -398,8 +398,8 @@ pub fn artifact_below_min_rarity(
     let rarity = detect_artifact_rarity(frame, scaler);
     if rarity < min_rarity {
         log_debug!(
-            "[rarity] {}星 < 最低{}星，应停止",
-            "[rarity] {}* < min {}*, should stop",
+            "[rarity] {}星 < 最低{}星，跳过此物品",
+            "[rarity] {}* < min {}*, skipping this item",
             rarity,
             min_rarity
         );
@@ -428,8 +428,8 @@ pub fn weapon_below_min_rarity(image: &RgbImage, scaler: &CoordScaler, min_rarit
     let rarity = detect_weapon_rarity(image, scaler);
     if rarity < min_rarity {
         log_debug!(
-            "[rarity] {}星 < 最低{}星，应停止",
-            "[rarity] {}* < min {}*, should stop",
+            "[rarity] {}星 < 最低{}星，跳过此物品",
+            "[rarity] {}* < min {}*, skipping this item",
             rarity,
             min_rarity
         );

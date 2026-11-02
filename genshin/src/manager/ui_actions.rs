@@ -13,6 +13,7 @@ use yas::{log_debug, log_info, log_warn};
 
 use yas::ocr::ImageToText;
 
+use crate::scanner::common::character_name::{clean_char_name, resolve_character_name};
 use crate::scanner::common::constants::*;
 use crate::scanner::common::coord_scaler::CoordScaler;
 use crate::scanner::common::debug_dump::{next_filter_dump_index, DumpCollector};
@@ -129,7 +130,7 @@ const SEL_ACTION_BUTTON_X: f64 = 1558.0;
 const SEL_ACTION_BUTTON_Y: f64 = 1025.0;
 
 /// OCR region for the action button text ("卸下" vs "装备").
-const SEL_ACTION_BUTTON_RECT: (f64, f64, f64, f64) = (1476.0, 992.0, 165.0, 45.0);
+pub(super) const SEL_ACTION_BUTTON_RECT: (f64, f64, f64, f64) = (1476.0, 992.0, 165.0, 45.0);
 
 /// Owner label in selection view, e.g. "叶洛亚已装备".
 /// 4K coordinates (3036, 1830) - (3500, 1910), divided by 2 for 1080p base.
@@ -360,14 +361,6 @@ pub fn open_character_screen(
     mappings: &MappingManager,
     ocr: &dyn ImageToText<RgbImage>,
 ) -> Result<()> {
-    // Reverse-lookup: GOOD key -> Chinese name(s) for matching
-    let cn_names: Vec<String> = mappings
-        .character_name_map
-        .iter()
-        .filter(|(_, v)| v.as_str() == char_key)
-        .map(|(k, _)| k.clone())
-        .collect();
-
     // Ensure we're in main world first, then open character screen.
     ctrl.return_to_main_ui(8);
     yas::utils::sleep(d_action() * 5 / 8);
@@ -418,64 +411,16 @@ pub fn open_character_screen(
             first_name = Some(name_trimmed.clone());
         }
 
-        // Extract and clean the character name part (strip element prefix + trailing garbage)
-        let clean_name = clean_char_name(&name_trimmed);
-
-        // Match against GOOD key directly (OCR might return English name)
-        if name_trimmed.contains(char_key) {
+        if resolve_character_name(&name_trimmed, &mappings.character_name_map).as_deref()
+            == Some(char_key)
+        {
             log_info!(
                 "[open_character_screen] 找到{}，位置{}",
-                "found {} at position {}",
+                "[open_character_screen] found {} at position {}",
                 char_key,
                 i
             );
             return Ok(());
-        }
-
-        // Match against Chinese name(s) — exact substring first, then fuzzy
-        let mut found = false;
-        for cn in &cn_names {
-            if name_trimmed.contains(cn.as_str()) {
-                log_info!(
-                    "[open_character_screen] 找到{}（中文: {}），位置{}",
-                    "found {} (cn: {}) at position {}",
-                    char_key,
-                    cn,
-                    i
-                );
-                return Ok(());
-            }
-            // Fuzzy match: allow 1 character difference for names >= 2 chars
-            if fuzzy_char_match(&clean_name, cn) {
-                log_info!(
-                    "[open_character_screen] 找到{}（中文: {}，模糊匹配'{}'），位置{}",
-                    "found {} (cn: {}, fuzzy match '{}') at position {}",
-                    char_key,
-                    cn,
-                    clean_name,
-                    i
-                );
-                found = true;
-                break;
-            }
-        }
-        if found {
-            return Ok(());
-        }
-
-        // Try reverse: OCR text -> GOOD key via mapping (try cleaned name too)
-        for try_name in &[&name_trimmed, &clean_name] {
-            if let Some(matched_key) = mappings.character_name_map.get(try_name.as_str()) {
-                if matched_key == char_key {
-                    log_info!(
-                        "[open_character_screen] 通过映射找到{}，位置{}",
-                        "found {} via mapping at position {}",
-                        char_key,
-                        i
-                    );
-                    return Ok(());
-                }
-            }
         }
 
         // Click next character
@@ -531,7 +476,15 @@ pub fn click_equipment_slot(ctrl: &mut GenshinGameController, slot_key: &str) ->
 ///
 /// When the selection view opens with the currently equipped artifact selected
 /// (always the first item), the "卸下" button appears at the bottom.
-pub fn click_unequip_button(ctrl: &mut GenshinGameController) -> Result<()> {
+pub fn click_unequip_button(
+    ctrl: &mut GenshinGameController,
+    ocr: &dyn ImageToText<RgbImage>,
+) -> Result<()> {
+    let button = ctrl.ocr_region(ocr, SEL_ACTION_BUTTON_RECT)?;
+    anyhow::ensure!(
+        button.contains("卸"),
+        "unequip button was not confirmed: {button}"
+    );
     ctrl.click_at(SEL_ACTION_BUTTON_X, SEL_ACTION_BUTTON_Y);
     yas::utils::sleep(d_action() * 5 / 8);
     Ok(())
@@ -2597,69 +2550,4 @@ fn ocr_region_enhanced(
 
     let text = ocr.image_to_text(&binarized, false)?;
     Ok(text.trim().to_string())
-}
-
-/// Extract the character name from an OCR'd name region.
-/// The format is "X元素 / 角色名" (e.g., "水元素 / 芙宁娜").
-/// Returns just the character name part, or the full text if no separator found.
-fn extract_char_name(text: &str) -> String {
-    let trimmed = text.trim();
-    // Try splitting on various separators OCR produces between element and name:
-    // "/" (ASCII), "／" (fullwidth), "丨" (CJK vertical U+4E28), "|", "1"
-    for sep in &['/', '／', '丨', '|'] {
-        if let Some(pos) = trimmed.rfind(*sep) {
-            let after = &trimmed[pos + sep.len_utf8()..].trim();
-            if !after.is_empty() {
-                return after.to_string();
-            }
-        }
-    }
-    // Also try splitting on "元素" directly — the name follows the element type
-    if let Some(pos) = trimmed.rfind("元素") {
-        let after = &trimmed[pos + "元素".len()..].trim();
-        if !after.is_empty() {
-            return after.to_string();
-        }
-    }
-    trimmed.to_string()
-}
-
-/// Clean a character name: extract the name part and strip trailing
-/// OCR garbage (dots, punctuation, etc.).
-fn clean_char_name(text: &str) -> String {
-    let name = extract_char_name(text);
-    // Strip trailing non-CJK characters (dots, punctuation, spaces, etc.)
-    let chars: Vec<char> = name.chars().collect();
-    let mut end = chars.len();
-    while end > 0 {
-        let c = chars[end - 1];
-        // Keep CJK unified ideographs, common CJK ranges
-        if c >= '\u{4e00}' && c <= '\u{9fff}' {
-            break;
-        }
-        // Also keep katakana/hiragana for Japanese-origin names
-        if c >= '\u{3040}' && c <= '\u{30ff}' {
-            break;
-        }
-        end -= 1;
-    }
-    chars[..end].iter().collect()
-}
-
-/// Fuzzy match two character names: returns true if they differ by at most
-/// 1 character and are at least 2 characters long.
-/// Uses character-level comparison on the Unicode chars.
-fn fuzzy_char_match(ocr_name: &str, expected: &str) -> bool {
-    let ocr_chars: Vec<char> = ocr_name.chars().collect();
-    let exp_chars: Vec<char> = expected.chars().collect();
-    // Must be same length and at least 2 characters
-    if ocr_chars.len() != exp_chars.len() || ocr_chars.len() < 2 {
-        return false;
-    }
-    let diffs = ocr_chars
-        .iter()
-        .zip(exp_chars.iter())
-        .filter(|(a, b)| a != b)
-        .count();
-    diffs <= 1
 }

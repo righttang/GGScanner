@@ -7,6 +7,7 @@ import platform
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,9 +29,20 @@ def base_url(value):
 
 def save(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    staged = path.with_suffix('.tmp')
-    staged.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-    staged.replace(path)
+    staged = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        staged.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
+        # Windows readers/antivirus may briefly prevent atomic replacement.
+        # Retry only this local write, never the recorded HTTP operation.
+        for attempt in range(20):
+            try:
+                staged.replace(path)
+                break
+            except PermissionError:
+                if attempt == 19:raise
+                time.sleep(.1)
+    finally:
+        staged.unlink(missing_ok=True)
 
 def transport(base, endpoint, body, mode='auto'):
     base = base_url(base)

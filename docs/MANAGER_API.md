@@ -286,7 +286,7 @@ Other fields (`location`, `lock`, `astralMark`, `totalRolls`, and substat `initi
 1. Open backpack → artifact tab; dismiss the in-game 5★ acquired-time filter (same as a full artifact scan).
 2. Optionally apply an in-game **set filter** when the server's "filter involved sets" option is enabled (GUI only — not an HTTP parameter). This limits the visible inventory to the sets present in the request.
 3. Walk the artifact grid, OCR each item, match targets, then **re-click matched cells and toggle lock** at page boundaries (before scrolling).
-4. Stop when all targets are matched (fast mode), when rarity drops below 4★, on user abort, or after visiting every item (full mode).
+4. Stop when all targets are matched (fast mode), on user abort, or after visiting every item (full mode). Artifacts below 4★ are skipped without ending traversal; they do not prove that later artifacts cannot match.
 
 Lock toggles use the scanned piece's `elixirCrafted` to apply a 40px Y-shift when clicking the lock icon (elixir banner shifts the panel).
 
@@ -391,15 +391,13 @@ Unequip instructions are processed first (all artifacts with `location: ""`), th
 
 For each equip instruction, the server:
 
-1. Opens the target character's equipment screen (press C, then cycle through the roster with OCR name matching)
-2. Clicks the artifact slot matching the artifact's `slotKey`
-3. Applies a **set filter** in the artifact selection grid to narrow results to the target `setKey`
-4. Iterates through the filtered grid, matching by **level** (OCR of "+20" badge) then **first substat value** (OCR)
-5. On match, clicks "替换" (Replace) to equip
+1. Opens the character screen and resolves each OCR name against the **complete character catalog before filtering pending targets**. Exact names take precedence over cataloged OCR corrections and unique fuzzy matches. One- or two-character names do not accept arbitrary one-character substitutions; ambiguous longer names are not selected.
+2. Opens the requested artifact slot and applies the relevant **set filter**. A filter or slot change can select an item that is not equipped on this character.
+3. Checks the selected artifact or searches the grid, using level as a candidate filter followed by the detail-panel stat/set checks. The grid is scrolled page-by-page (up to 50 pages) if needed. Clients must still reject non-unique identities across their full inventory; a set/slot/level or first substat alone is insufficient.
+4. Rechecks the selected identity before changing equipment. An item already observed on the requested owner returns `already_correct`; otherwise the server submits the equip/replace action.
+5. Reads the selected artifact's owner after the action. `success` requires the requested owner to be recognized. An unreadable or different owner returns `ui_error`, even if the input was submitted. The input is not automatically repeated.
 
-The combination of set filter + slot tab + level + substat value is almost always unique. The grid is scrolled page-by-page (up to 20 pages) if needed.
-
-For unequip, the server navigates to the artifact's current owner (from `artifact.location`), opens the slot, and clicks the unequip button.
+For unequip, `artifact.location` is a navigation hint to the current owner, though it remains excluded from artifact identity matching. The server checks the selected identity, owner, and unequip button before clicking; it then checks that the owner label is absent and the action has changed to Equip. An unconfirmed result returns `ui_error` and may already have changed the game, so inspect before retrying.
 
 #### Result IDs
 
@@ -408,7 +406,7 @@ Positional IDs based on order in the `equip` list:
 
 #### Game Swap Behavior
 
-When equipping an artifact that is currently equipped on another character, the game **automatically swaps** — the target character receives the artifact, and the previous owner loses it (the slot becomes empty). The client can assume this swap occurred on success and update both characters' state accordingly.
+Moving an equipped artifact can also change the previous owner's equipment. Do not assume that the previous owner's slot is empty or that its other items stayed unchanged. The instruction receipt confirms the requested artifact's destination, not a complete snapshot of both characters. Observe or rescan all affected owners before reconciling their loadouts.
 
 #### Responses
 
@@ -518,6 +516,7 @@ Each cache stores only the latest completed jobId for its type. A characters-onl
 
 **Notes:**
 - Scanning is read-only — it does not modify in-game state or invalidate existing caches.
+- Minimum rarity filters individual results only. A low-rarity artifact or weapon is skipped without stopping the scan, regardless of level or sort order. This applies to GUI, CLI, and API scans; the lock manager likewise continues past low-rarity artifacts.
 - Scan jobs share the same job queue as manage/equip — one job at a time.
 - If a scan fails (e.g., game window not found), previously cached data from earlier scans is preserved.
 
@@ -783,7 +782,7 @@ The `jobId` parameter is **optional** for backwards compatibility:
 - **Scan jobs** (`POST /scan` with `artifacts: true`): populates the artifact cache with the full scan results.
 - **Manage jobs** (`POST /manage`): populates the artifact cache with a post-toggle snapshot **only when all of the following hold**:
   - Full inventory mode (GUI "update inventory" ON and "filter involved sets" OFF — no fast-mode early stop),
-  - Scan reached every artifact in the bag (or stopped only at the 4★ rarity floor),
+  - Scan reached every artifact in the bag (a low-rarity item alone never proves completeness),
   - User did not abort,
   - No OCR failures on scanned items and no roll-solver failures on leveled artifacts.
   If a manage job runs but no snapshot is produced (fast mode, abort, data quality issues), the cache is **invalidated** — `GET /artifacts?jobId=<that manage jobId>` returns **404**, not 503. HTTP **503** for `GET /artifacts` applies only when a **`POST /scan`** job attempted artifacts but did not finish (`incomplete_jobId`).
@@ -905,6 +904,15 @@ All targets execute in a single backpack scan pass. Invalid entries (empty keys,
 **Duplicate-aware request:** If the client locks two pieces with identical stat lines, list order must match the intended backpack order (or include disambiguating fields the server does not yet support, such as `location`). Otherwise the wrong physical piece may be toggled even when OCR is perfect.
 
 ## Changelog
+
+### 2026-11-02
+
+- **Character identity is resolved globally before target selection.** Exact names cannot lose to a fuzzy match from a different pending character. Short-name substitutions and ambiguous longer names are rejected; roster navigation and owner-label checks share the same conservative resolver.
+- **Equip outcomes require observed ownership.** Finding an item or submitting a click is insufficient for `success` or `already_correct`. Unconfirmed ownership returns `ui_error`; unequip also checks identity and button state before and after the action. The wire format is unchanged.
+
+### 2026-11-01
+
+- **Low rarity no longer stops scanning.** Artifacts and weapons below the configured minimum are skipped wherever they appear, including level-zero items. GUI, CLI, and API scans continue to the traversal limit or normal cancellation/error boundary. Lock management also continues past low-rarity artifacts and requires complete traversal to prove a target absent. This replaces the historical rarity early-stop behavior described below.
 
 ### 2026-09-18
 

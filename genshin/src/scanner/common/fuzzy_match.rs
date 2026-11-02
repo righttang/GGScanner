@@ -43,34 +43,8 @@ const OCR_CONFUSIONS: &[(&str, &str)] = &[
     ("\u{7984}", "\u{6E0C}"), // 禄 → 渌
 ];
 
-/// Fuzzy match OCR text against a name→key map.
-///
-/// Matching strategy (in order):
-/// 1. Exact match on cleaned text
-/// 2. OCR confusion substitution → exact match
-/// 3. Substring match (longest match wins, both directions)
-/// 4. Levenshtein distance fallback (threshold: 30% of name length)
-/// 5. Longest common substring uniqueness fallback — if the OCR text shares a
-///    uniquely long common substring (≥2 CJK chars) with exactly one candidate,
-///    match it. Handles cases like "海染碟" → "海染砗磲" where OCR garbled the
-///    tail but the shared prefix "海染" is unique across all candidates.
-///
-/// Port of `fuzzyMatchMap()` from GOODScanner/lib/constants.js
-/// Like `fuzzy_match_map` but also returns the matched entity name (map key).
-/// Returns `Some((entity_name, good_key))` on match.
-pub fn fuzzy_match_map_pair(text: &str, map: &HashMap<String, String>) -> Option<(String, String)> {
-    fuzzy_match_map_inner(text, map)
-}
-
-pub fn fuzzy_match_map(text: &str, map: &HashMap<String, String>) -> Option<String> {
-    fuzzy_match_map_inner(text, map).map(|(_, val)| val)
-}
-
-fn fuzzy_match_map_inner(text: &str, map: &HashMap<String, String>) -> Option<(String, String)> {
-    if text.is_empty() {
-        return None;
-    }
-
+/// Shared normalization for OCR catalog lookup and action identity checks.
+pub(crate) fn normalize_ocr_text(text: &str) -> String {
     // Clean OCR text: normalize lookalike characters, then keep CJK, alphanumeric, and 「」.
     // OCR engines sometimes output:
     //   - Fullwidth characters (U+FF01..U+FF5E) instead of ASCII
@@ -104,7 +78,66 @@ fn fuzzy_match_map_inner(text: &str, map: &HashMap<String, String>) -> Option<(S
             matches!(*c, '\u{4E00}'..='\u{9FFF}' | '\u{300C}' | '\u{300D}' | 'a'..='z' | 'A'..='Z' | '0'..='9')
         })
         .collect();
-    let cleaned = cleaned.trim().to_string();
+    cleaned.trim().to_string()
+}
+
+/// Cataloged corrections only; callers choose their own ambiguity policy.
+pub(crate) fn ocr_confusion_variants(cleaned: &str) -> Vec<String> {
+    let mut variants = Vec::new();
+    for &(from, to) in OCR_CONFUSIONS {
+        if cleaned.contains(from) {
+            let alt = cleaned.replace(from, to);
+            if alt != cleaned && !variants.contains(&alt) {
+                variants.push(alt);
+            }
+        }
+    }
+    // Single pass avoids cascading bidirectional substitutions.
+    let combined: String = cleaned
+        .chars()
+        .map(|c| {
+            let cs = c.to_string();
+            OCR_CONFUSIONS
+                .iter()
+                .find(|(from, _)| cs == *from)
+                .map_or(c, |(_, to)| to.chars().next().unwrap_or(c))
+        })
+        .collect();
+    if combined != cleaned && !variants.contains(&combined) {
+        variants.push(combined);
+    }
+    variants
+}
+
+/// Fuzzy match OCR text against a name→key map.
+///
+/// Matching strategy (in order):
+/// 1. Exact match on cleaned text
+/// 2. OCR confusion substitution → exact match
+/// 3. Substring match (longest match wins, both directions)
+/// 4. Levenshtein distance fallback (threshold: 30% of name length)
+/// 5. Longest common substring uniqueness fallback — if the OCR text shares a
+///    uniquely long common substring (≥2 CJK chars) with exactly one candidate,
+///    match it. Handles cases like "海染碟" → "海染砗磲" where OCR garbled the
+///    tail but the shared prefix "海染" is unique across all candidates.
+///
+/// Port of `fuzzyMatchMap()` from GOODScanner/lib/constants.js
+/// Like `fuzzy_match_map` but also returns the matched entity name (map key).
+/// Returns `Some((entity_name, good_key))` on match.
+pub fn fuzzy_match_map_pair(text: &str, map: &HashMap<String, String>) -> Option<(String, String)> {
+    fuzzy_match_map_inner(text, map)
+}
+
+pub fn fuzzy_match_map(text: &str, map: &HashMap<String, String>) -> Option<String> {
+    fuzzy_match_map_inner(text, map).map(|(_, val)| val)
+}
+
+fn fuzzy_match_map_inner(text: &str, map: &HashMap<String, String>) -> Option<(String, String)> {
+    if text.is_empty() {
+        return None;
+    }
+
+    let cleaned = normalize_ocr_text(text);
     if cleaned.is_empty() {
         return None;
     }
@@ -114,44 +147,16 @@ fn fuzzy_match_map_inner(text: &str, map: &HashMap<String, String>) -> Option<(S
         return Some((cleaned, val.clone()));
     }
 
-    // Try OCR confusion substitutions (individual)
-    for &(from, to) in OCR_CONFUSIONS {
-        if cleaned.contains(from) {
-            let alt = cleaned.replace(from, to);
-            if let Some(val) = map.get(&alt) {
-                return Some((alt, val.clone()));
-            }
-        }
-    }
-
-    // Try applying ALL confusion substitutions simultaneously.
-    // Needed when OCR garbles multiple characters (e.g. 菈乌玛 → 拉鸟玛:
-    // 拉→菈 alone gives 菈鸟玛, 鸟→乌 alone gives 拉乌玛 — neither matches).
-    // Single-pass char-by-char avoids cascading issues with bidirectional pairs.
-    {
-        let combined: String = cleaned
-            .chars()
-            .map(|c| {
-                let cs: String = c.to_string();
-                for &(from, to) in OCR_CONFUSIONS {
-                    if cs == from {
-                        return to.chars().next().unwrap_or(c);
-                    }
-                }
-                c
-            })
-            .collect();
-        if combined != cleaned {
-            if let Some(val) = map.get(&combined) {
-                log_debug!(
-                    "[fuzzy] 组合OCR混淆匹配: cleaned={:?} → {} ({})",
-                    "[fuzzy] combined OCR confusion match: cleaned={:?} → {} ({})",
-                    cleaned,
-                    combined,
-                    val
-                );
-                return Some((combined, val.clone()));
-            }
+    for alt in ocr_confusion_variants(&cleaned) {
+        if let Some(val) = map.get(&alt) {
+            log_debug!(
+                "[fuzzy] OCR混淆匹配: cleaned={:?} → {} ({})",
+                "[fuzzy] OCR confusion match: cleaned={:?} → {} ({})",
+                cleaned,
+                alt,
+                val
+            );
+            return Some((alt, val.clone()));
         }
     }
 

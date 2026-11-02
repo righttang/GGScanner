@@ -159,7 +159,6 @@ impl ArtifactOcrRegions {
 /// Result of scanning a single artifact
 pub enum ArtifactScanResult {
     Artifact(GoodArtifact),
-    Stop,
     Skip,
 }
 
@@ -520,43 +519,19 @@ impl GoodArtifactScanner {
         item_index: usize,
         grid_icons: Option<GridIconResult>,
     ) -> Result<ArtifactScanResult> {
-        // 0. Detect rarity — stop below min_rarity only if level is 0.
+        // Rarity filters this item only. Inventory order does not prove that
+        // later items are also below the threshold, even when this item is +0.
         let rarity = pixel_utils::detect_artifact_rarity(image, scaler);
 
         if rarity < config.min_rarity {
-            // Quick level OCR to check if this is lv0 (no elixir shift — rough check is fine)
-            let level_text =
-                Self::ocr_image_region_shifted(ocr, image, ocr_regions.level, 0.0, scaler)
-                    .unwrap_or_default();
-            let quick_level = parse_artifact_level(&level_text);
-            if quick_level == Some(0) {
-                log_debug!(
-                    "[artifact] idx={} {}星 lv0 < 最低{}星，停止",
-                    "[artifact] idx={} {}* lv0 < min {}*, stopping",
-                    item_index,
-                    rarity,
-                    config.min_rarity
-                );
-                annotator::finalize_skip(&format!(
-                    "{}* lv0 below min {}*",
-                    rarity, config.min_rarity
-                ));
-                return Ok(ArtifactScanResult::Stop);
-            }
             log_debug!(
-                "[artifact] idx={} {}星 lv{} < 最低{}星，跳过（非lv0）",
-                "[artifact] idx={} {}* lv{} < min {}*, skipping (not lv0)",
+                "[artifact] idx={} {}星 < 最低{}星，跳过",
+                "[artifact] idx={} {}* < min {}*, skipping",
                 item_index,
                 rarity,
-                quick_level.map_or_else(|| "?".to_string(), |v| v.to_string()),
                 config.min_rarity
             );
-            annotator::finalize_skip(&format!(
-                "{}* lv{} below min {}*",
-                rarity,
-                quick_level.map_or_else(|| "?".to_string(), |v| v.to_string()),
-                config.min_rarity
-            ));
+            annotator::finalize_skip(&format!("{}* below min {}*", rarity, config.min_rarity));
             return Ok(ArtifactScanResult::Skip);
         }
 
@@ -1517,7 +1492,7 @@ impl GoodArtifactScanner {
             continue_on_failure: true,
             dump_images: false,
             verbose: false,
-            min_rarity: 1, // don't stop on low rarity, just return None
+            min_rarity: 4, // management only matches 4/5-star artifacts
             ..Default::default()
         };
 
@@ -1533,7 +1508,7 @@ impl GoodArtifactScanner {
             grid_icons,
         ) {
             Ok(ArtifactScanResult::Artifact(a)) => Ok(Some(a)),
-            Ok(ArtifactScanResult::Stop) | Ok(ArtifactScanResult::Skip) => Ok(None),
+            Ok(ArtifactScanResult::Skip) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -1695,7 +1670,7 @@ impl GoodArtifactScanner {
                     if worker_cancel.is_cancelled() {
                         return Ok(None);
                     }
-                    // Quick rarity check — stop below min_rarity.
+                    // Skip only this item; capture continues through the inventory.
                     if pixel_utils::artifact_below_min_rarity(
                         &work_item.frame,
                         &worker_scaler,
@@ -1733,7 +1708,6 @@ impl GoodArtifactScanner {
                                 Ok(None)
                             }
                         },
-                        Ok(ArtifactScanResult::Stop) => Ok(None),
                         Ok(ArtifactScanResult::Skip) => Ok(None),
                         Err(e) => {
                             annotator::finalize_error(None, &e.to_string());
@@ -1799,7 +1773,7 @@ impl GoodArtifactScanner {
             Ok(())
         };
 
-        bp.scan_grid(total, &scan_config, start_at, |ctrl, event| {
+        bp.scan_grid(total, &scan_config, start_at, |_, event| {
             match event {
                 GridEvent::PageStarted { .. } => ScanAction::Continue,
                 GridEvent::PageCompleted { .. } => {
@@ -1825,18 +1799,6 @@ impl GoodArtifactScanner {
 
                     if let Some(pf) = progress_fn {
                         pf(idx + 1, progress_total, "", "");
-                    }
-
-                    // Quick rarity check on main thread to stop early.
-                    if pixel_utils::artifact_below_min_rarity(
-                        &frame,
-                        &scaler,
-                        self.config.min_rarity,
-                    ) {
-                        voter.finish_additional_passes(&scaler, || ctrl.capture_game().ok());
-                        let ready = voter.early_stop_flush();
-                        let _ = emit_ready(ready, &item_tx);
-                        return ScanAction::Stop;
                     }
 
                     let ready = voter.record_with_layout(
@@ -2240,34 +2202,110 @@ mod tests {
     }
 
     #[test]
-    fn test_artifact_low_rarity_stops() {
+    fn low_rarity_artifacts_skip_without_ocr_or_failure() {
+        for min_rarity in [4, 5] {
+            for rarity in 1..min_rarity {
+                for continue_on_failure in [false, true] {
+                    let mut image = make_1080p_image();
+                    paint_rarity_stars(&mut image, rarity);
+                    // No level/name OCR is needed, including for +0 or unreadable levels.
+                    let level_ocr = FakeOcr::new(vec![]);
+                    let general_ocr = FakeOcr::new(vec![]);
+                    let config = GoodArtifactScannerConfig {
+                        min_rarity,
+                        continue_on_failure,
+                        ..default_config()
+                    };
+                    let result = GoodArtifactScanner::scan_single_artifact(
+                        &level_ocr,
+                        &general_ocr,
+                        &CaptureFrame::full(image),
+                        &make_1080p_scaler(),
+                        &ArtifactOcrRegions::new(),
+                        &make_test_mappings(),
+                        &config,
+                        0,
+                        None,
+                    )
+                    .unwrap();
+                    assert!(matches!(result, ArtifactScanResult::Skip));
+                    assert_eq!(level_ocr.call_count(), 0);
+                    assert_eq!(general_ocr.call_count(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_rarity_artifacts_retain_later_items_and_scan_indices() {
+        let (sender, worker) = scan_worker::start_worker(true, |item: WorkItem<()>| {
+            let level_ocr = FakeOcr::new(vec!["+20"]);
+            let general_ocr = FakeOcr::new(vec![
+                "生之花",
+                "生命值",
+                "+20",
+                "暴击率+10.5%",
+                "暴击伤害+21.0%",
+                "攻击力+9.3%",
+                "元素充能效率+6.5%",
+                "角斗士的终幕礼",
+                "",
+            ]);
+            match GoodArtifactScanner::scan_single_artifact(
+                &level_ocr,
+                &general_ocr,
+                &item.frame,
+                &make_1080p_scaler(),
+                &ArtifactOcrRegions::new(),
+                &make_test_mappings(),
+                &default_config(),
+                item.index,
+                None,
+            )? {
+                ArtifactScanResult::Artifact(artifact) => Ok(Some(artifact)),
+                ArtifactScanResult::Skip => Ok(None),
+            }
+        });
+        for (index, rarity) in [5, 3, 5, 2, 5].into_iter().enumerate() {
+            let mut image = make_1080p_image();
+            paint_rarity_stars(&mut image, rarity);
+            paint_elixir_banner(&mut image, false);
+            sender
+                .send(WorkItem {
+                    index,
+                    frame: CaptureFrame::full(image),
+                    metadata: (),
+                    grid_annotation: None,
+                })
+                .unwrap();
+        }
+        drop(sender);
+        let (artifacts, indices) = worker
+            .join(|_| panic!("low rarity is not an OCR failure"))
+            .unwrap();
+        assert_eq!(indices, [0, 2, 4]);
+        assert_eq!(artifacts.len(), 3);
+        assert!(artifacts.iter().all(|artifact| artifact.rarity == 5));
+    }
+
+    #[test]
+    fn manager_identification_skips_low_rarity_without_ocr() {
         let mut image = make_1080p_image();
         paint_rarity_stars(&mut image, 3);
-        let scaler = make_1080p_scaler();
-        let regions = ArtifactOcrRegions::new();
-        let mappings = make_test_mappings();
-        let config = default_config();
-
-        // Quick level OCR returns "+0" → lv0, so rarity < min_rarity triggers Stop
-        let level_ocr = FakeOcr::new(vec!["+0"]);
-        let general_ocr = FakeOcr::new(vec![]);
-
-        let result = GoodArtifactScanner::scan_single_artifact(
-            &level_ocr,
-            &general_ocr,
-            &CaptureFrame::full(image.clone()),
-            &scaler,
-            &regions,
-            &mappings,
-            &config,
-            0,
+        let ocr = FakeOcr::new(vec![]);
+        let substat_ocr = FakeOcr::new(vec![]);
+        assert!(GoodArtifactScanner::identify_artifact(
+            &ocr,
+            &substat_ocr,
+            &CaptureFrame::full(image),
+            &make_1080p_scaler(),
+            &make_test_mappings(),
             None,
         )
-        .unwrap();
-
-        assert!(matches!(result, ArtifactScanResult::Stop));
-        assert_eq!(level_ocr.call_count(), 1); // quick level check
-        assert_eq!(general_ocr.call_count(), 0);
+        .unwrap()
+        .is_none());
+        assert_eq!(ocr.call_count(), 0);
+        assert_eq!(substat_ocr.call_count(), 0);
     }
 
     #[test]

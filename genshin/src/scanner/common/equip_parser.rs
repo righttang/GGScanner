@@ -1,3 +1,4 @@
+use super::character_name::resolve_character_name;
 use super::fuzzy_match::fuzzy_match_map;
 use std::collections::HashMap;
 
@@ -28,7 +29,17 @@ pub fn parse_equip_location(text: &str, char_map: &HashMap<String, String>) -> S
 /// "已装备" marker because the manager only needs to know whether the selected
 /// artifact is owned by the currently processed character.
 pub fn parse_equip_owner(text: &str, char_map: &HashMap<String, String>) -> String {
-    parse_equip_owner_name(strip_equip_markers(text), char_map)
+    let stripped = strip_equip_markers(text);
+    if let Some(key) = resolve_character_name(&stripped, char_map) {
+        return key;
+    }
+    // Selection-card decorations may add ASCII noise before a Chinese name.
+    // Preserve exact custom names before considering this narrower crop.
+    if char_map.contains_key(stripped.trim()) {
+        return String::new();
+    }
+    let cleaned = stripped.trim_start_matches(|c: char| c.is_ascii() || !c.is_alphanumeric());
+    resolve_character_name(cleaned, char_map).unwrap_or_default()
 }
 
 fn strip_equip_markers(text: &str) -> String {
@@ -85,6 +96,18 @@ mod tests {
     #[test]
     fn parses_owner_through_fuzzy_normalization() {
         assert_eq!(parse_equip_owner("拉鸟玛已装备", &char_map()), "Lauma");
+    }
+
+    #[test]
+    fn action_owner_parser_preserves_exact_short_names_and_rejects_uncertain_ones() {
+        let mut names = char_map();
+        names.insert("闲云".into(), "Xianyun".into());
+        names.insert("重云".into(), "Chongyun".into());
+        names.insert("a".into(), "Manekin".into());
+        assert_eq!(parse_equip_owner("c闲云已装备", &names), "Xianyun");
+        assert_eq!(parse_equip_owner("重云已装备", &names), "Chongyun");
+        assert_eq!(parse_equip_owner("闲芸已装备", &names), "");
+        assert_eq!(parse_equip_owner("a已装备", &names), "Manekin");
     }
 
     #[test]
