@@ -20,6 +20,24 @@ const MANAGER_INSTRUCTIONS: &str =
     include_str!("../../experimental/hsr/tests/fixtures/manager_instructions_v1.json");
 
 #[test]
+fn mining_navigation_falls_back_when_switching_to_star_rail() {
+    let mut navigation = GameNavigation {
+        active_game: Game::StarRail,
+        selected_tab: ToolTab::Mining,
+    };
+    assert_eq!(navigation.active_tab(), ToolTab::Scanner);
+    navigation.active_game = Game::Genshin;
+    assert_eq!(
+        navigation.active_tab(),
+        if cfg!(target_os = "windows") {
+            ToolTab::Mining
+        } else {
+            ToolTab::Scanner
+        }
+    );
+}
+
+#[test]
 fn debugging_options_default_off_and_saved_choices_survive_both_config_loaders() {
     let root = temp_root("debug-policy");
     fs::create_dir_all(&root).unwrap();

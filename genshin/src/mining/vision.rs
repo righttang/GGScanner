@@ -1,0 +1,664 @@
+use super::routes::{download, write_cache};
+use anyhow::{ensure, Result};
+use image::{
+    imageops::{self, FilterType},
+    GrayImage, RgbImage,
+};
+use ort::{session::Session, value::Value};
+use rayon::prelude::*;
+use std::path::PathBuf;
+
+const ASSETS: &str = "https://raw.githubusercontent.com/babalae/bettergi-libraries/13937839dba42df5384940e3cff2e4eff7e29e19";
+
+pub(super) fn asset(relative: &str) -> Result<PathBuf> {
+    let path =
+        PathBuf::from("data/mining/assets/13937839dba42df5384940e3cff2e4eff7e29e19").join(relative);
+    if !path.is_file() {
+        write_cache(&path, &download(&format!("{ASSETS}/{relative}"))?)?;
+    }
+    Ok(path)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Ore {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub confidence: f32,
+}
+
+pub(super) fn aiming_active(frame: &RgbImage) -> bool {
+    // The aim exit R keycap is independent of the scene and charge animation.
+    // Bright cliffs can resemble the center crosshair in an ordinary world view.
+    let mut white = 0;
+    let mut dark = 0;
+    for y in 1028..1052 {
+        for x in 1706..1742 {
+            let p = frame.get_pixel(x, y).0;
+            let minimum = *p.iter().min().unwrap();
+            let maximum = *p.iter().max().unwrap();
+            if minimum > 210 && maximum - minimum < 45 {
+                white += 1;
+            }
+            if maximum < 120 {
+                dark += 1;
+            }
+        }
+    }
+    white >= 450 && dark >= 40 && white + dark >= 650
+}
+
+/// Horizontal bands of bright UI glyphs, with padding for a single-line OCR model.
+pub(super) fn text_rows(
+    frame: &RgbImage,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Vec<(u32, u32)> {
+    let mut rows = Vec::new();
+    let mut start = None;
+    let mut last = 0;
+    for line in y..y + height {
+        let bright = (x..x + width)
+            .filter(|&column| {
+                let p = frame.get_pixel(column, line).0;
+                *p.iter().min().unwrap() > 185
+                    && p.iter().max().unwrap() - p.iter().min().unwrap() < 65
+            })
+            .count()
+            >= 8;
+        if bright {
+            start.get_or_insert(line);
+            last = line;
+        }
+        if (line > last + 3 || line == y + height - 1) && start.is_some() {
+            let first = start.take().unwrap();
+            if (12..=42).contains(&(last - first + 1)) {
+                rows.push((first.saturating_sub(3), last - first + 7));
+            }
+        }
+    }
+    rows
+}
+
+pub(super) struct OreDetector {
+    model: Session,
+}
+impl OreDetector {
+    pub fn new() -> Result<Self> {
+        let path = asset("BetterGI.Assets.Model/Assets/Model/Mine/bgi_mine.onnx")?;
+        Ok(Self {
+            model: Session::builder()?
+                .with_intra_threads(2)?
+                .commit_from_file(path)?,
+        })
+    }
+    pub fn detect(&mut self, frame: &RgbImage) -> Result<Vec<Ore>> {
+        let size = 640;
+        let scale = (size as f64 / frame.width() as f64).min(size as f64 / frame.height() as f64);
+        let width = (frame.width() as f64 * scale).round() as u32;
+        let height = (frame.height() as f64 * scale).round() as u32;
+        let resized = imageops::resize(frame, width, height, FilterType::Triangle);
+        let left = (size - width) / 2;
+        let top = (size - height) / 2;
+        let mut tensor = ndarray::Array4::<f32>::from_elem((1, 3, 640, 640), 114.0 / 255.0);
+        for (x, y, p) in resized.enumerate_pixels() {
+            for channel in 0..3 {
+                tensor[[0, channel, (y + top) as usize, (x + left) as usize]] =
+                    p[channel] as f32 / 255.0;
+            }
+        }
+        let result = self.model.run(ort::inputs![Value::from_array(tensor)?])?;
+        let (shape, data) = result[0].try_extract_tensor::<f32>()?;
+        ensure!(
+            shape.len() == 3 && shape[1] == 5,
+            "Expected single-class YOLO output [1,5,N], received {shape:?}"
+        );
+        let count = shape[2] as usize;
+        let mut ores = Vec::new();
+        for i in 0..count {
+            let confidence = data[4 * count + i];
+            if confidence < 0.70 {
+                continue;
+            }
+            let x = (data[i] as f64 - left as f64) / scale;
+            let y = (data[count + i] as f64 - top as f64) / scale;
+            let width = data[2 * count + i] as f64 / scale;
+            let height = data[3 * count + i] as f64 / scale;
+            if width > 1.0
+                && height > 1.0
+                && x > 0.0
+                && y > 0.0
+                && x < frame.width() as f64
+                && y < frame.height() as f64
+            {
+                ores.push(Ore {
+                    x,
+                    y,
+                    width,
+                    height,
+                    confidence,
+                });
+            }
+        }
+        ores.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+        let mut kept: Vec<Ore> = Vec::new();
+        for ore in ores {
+            if kept.iter().all(|other| {
+                (other.x - ore.x).abs() > (other.width + ore.width) * 0.25
+                    || (other.y - ore.y).abs() > (other.height + ore.height) * 0.25
+            }) {
+                kept.push(ore);
+            }
+        }
+        Ok(kept)
+    }
+}
+
+/// Map coordinates are the BGI 256-pixel atlas convention. The atlas origin
+/// corresponds to the Teyvat world's (0,0), with both world axes reversed.
+#[cfg(test)]
+fn world_to_atlas(x: f64, y: f64) -> (f64, f64) {
+    ((32768.0 - 2.0 * x) / 8.0, (24576.0 - 2.0 * y) / 8.0)
+}
+#[cfg(test)]
+fn atlas_to_world(x: f64, y: f64) -> (f64, f64) {
+    ((32768.0 - x * 8.0) / 2.0, (24576.0 - y * 8.0) / 2.0)
+}
+
+pub(super) fn big_map_scales() -> Vec<f64> {
+    (10..=55).map(|n| n as f64 / 100.0).collect()
+}
+
+pub(super) struct Atlas {
+    pub image: GrayImage,
+    origin: (f64, f64),
+    world_scale: f64,
+    minimum_correlation: f64,
+}
+
+impl Atlas {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            image: image::open(asset(
+                "BetterGI.Assets.Map/Assets/Map/Teyvat/Teyvat_0_256.png",
+            )?)?
+            .to_luma8(),
+            origin: (4096.0, 3072.0),
+            world_scale: 0.25,
+            minimum_correlation: 0.55,
+        })
+    }
+
+    /// Sparse zero-mean normalized correlation. A coarse pass chooses the
+    /// candidate, then full pixel precision refines its center. Icons and the
+    /// player marker are excluded from the circular mini-map sample.
+    pub fn locate(
+        &self,
+        query: &RgbImage,
+        center: Option<(f64, f64)>,
+        radius: i32,
+        scales: &[f64],
+        circular: bool,
+        cancel: Option<&yas::cancel::CancelToken>,
+    ) -> Result<(f64, f64, f64)> {
+        let gray = imageops::grayscale(query);
+        let (ax, ay) = center
+            .map(|p| {
+                (
+                    self.origin.0 - p.0 * self.world_scale,
+                    self.origin.1 - p.1 * self.world_scale,
+                )
+            })
+            .unwrap_or((
+                self.image.width() as f64 / 2.0,
+                self.image.height() as f64 / 2.0,
+            ));
+        let mut best = (-1.0, 0.0, 0.0, 0.0);
+        for &scale in scales {
+            let w = (gray.width() as f64 * scale).round() as u32;
+            let h = (gray.height() as f64 * scale).round() as u32;
+            if w < 12 || h < 12 {
+                continue;
+            }
+            let small = imageops::resize(&gray, w, h, FilterType::Triangle);
+            let mut samples = Vec::new();
+            let sample_stride = (w.max(h) / 16).max(2) as usize;
+            for y in (2..h - 2).step_by(sample_stride) {
+                for x in (2..w - 2).step_by(sample_stride) {
+                    let d = ((x as f64 / w as f64 - 0.5).powi(2)
+                        + (y as f64 / h as f64 - 0.5).powi(2))
+                    .sqrt();
+                    if !circular || (0.12..0.44).contains(&d) {
+                        samples.push((
+                            x as i32 - w as i32 / 2,
+                            y as i32 - h as i32 / 2,
+                            small.get_pixel(x, y)[0] as f64,
+                        ));
+                    }
+                }
+            }
+            let n = samples.len() as f64;
+            let mean = samples.iter().map(|p| p.2).sum::<f64>() / n;
+            for sample in &mut samples {
+                sample.2 -= mean;
+            }
+            let norm = samples.iter().map(|p| p.2 * p.2).sum::<f64>().sqrt();
+            if norm < 1.0 {
+                continue;
+            }
+            let minx = ((ax as i32 - radius).max(w as i32 / 2 + 1)) as usize;
+            let maxx = ((ax as i32 + radius).min(self.image.width() as i32 - w as i32 / 2 - 2))
+                .max(0) as usize;
+            let miny = ((ay as i32 - radius).max(h as i32 / 2 + 1)) as usize;
+            let maxy = ((ay as i32 + radius).min(self.image.height() as i32 - h as i32 / 2 - 2))
+                .max(0) as usize;
+            let pixels = self.image.as_raw();
+            let atlas_width = self.image.width() as usize;
+            let score = |x: i32, y: i32| {
+                let mut sum = 0.0;
+                let mut squared = 0.0;
+                let mut dot = 0.0;
+                for &(dx, dy, q) in &samples {
+                    let p = pixels[(y + dy) as usize * atlas_width + (x + dx) as usize] as f64;
+                    sum += p;
+                    squared += p * p;
+                    dot += p * q;
+                }
+                dot / (norm * (squared - sum * sum / n).max(0.01).sqrt())
+            };
+            let stride = if radius > 400 { 8 } else { 1 };
+            let rows: Vec<_> = (miny..maxy).step_by(stride).collect();
+            let mut candidate = rows
+                .par_iter()
+                .map(|&y| -> Result<(f64, i32, i32)> {
+                    ensure!(!cancel.is_some_and(|t| t.check_rmb()), "Mining stopped");
+                    let mut row_best = (-1.0, 0, 0);
+                    for x in (minx..maxx).step_by(stride) {
+                        let s = score(x as i32, y as i32);
+                        if s > row_best.0 {
+                            row_best = (s, x as i32, y as i32);
+                        }
+                    }
+                    Ok(row_best)
+                })
+                .try_reduce(|| (-1.0, 0, 0), |a, b| Ok(if a.0 > b.0 { a } else { b }))?;
+            if candidate.0 < 0.0 {
+                continue;
+            }
+            let coarse = candidate;
+            for y in (coarse.2 - stride as i32).max(miny as i32)
+                ..=(coarse.2 + stride as i32).min(maxy as i32 - 1)
+            {
+                for x in (coarse.1 - stride as i32).max(minx as i32)
+                    ..=(coarse.1 + stride as i32).min(maxx as i32 - 1)
+                {
+                    let s = score(x, y);
+                    if s > candidate.0 {
+                        candidate = (s, x, y);
+                    }
+                }
+            }
+            if candidate.0 > best.0 {
+                best = (candidate.0, candidate.1 as f64, candidate.2 as f64, scale);
+            }
+        }
+        ensure!(
+            best.0 >= self.minimum_correlation,
+            "Map location unconfirmed (correlation {:.3})",
+            best.0
+        );
+        let world = (
+            (self.origin.0 - best.1) / self.world_scale,
+            (self.origin.1 - best.2) / self.world_scale,
+        );
+        Ok((world.0, world.1, best.3))
+    }
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Layer {
+    layer_id: String,
+    left: f64,
+    top: f64,
+    scale: f64,
+    floor: i32,
+}
+
+/// City mini-maps use their own projection and magnification. Match those
+/// templates before the surrounding overworld, preserving world coordinates.
+pub(super) struct MiniMapLocator {
+    layers: Vec<Layer>,
+    loaded: std::collections::HashMap<String, Atlas>,
+    scales: Vec<f64>,
+}
+
+impl MiniMapLocator {
+    pub fn new() -> Result<Self> {
+        let mut layers = Vec::new();
+        for manifest in [
+            "mapback_info.json",
+            "mapback_6_0_info.json",
+            "template_match_studio_mapback.json",
+            "city_info.json",
+            "city_5_8_info.json",
+            "city_6_0_info.json",
+            "template_match_studio_cities.json",
+        ] {
+            let path = asset(&format!("BetterGI.Assets.Map/Assets/Map/Teyvat/{manifest}"))?;
+            let records: Vec<Layer> = serde_json::from_slice(&std::fs::read(path)?)?;
+            layers.extend(records.into_iter().filter(|r| r.floor == 0));
+        }
+        Ok(Self {
+            layers,
+            loaded: Default::default(),
+            scales: vec![1.60, 1.6333, 1.666667, 1.70, 1.7333],
+        })
+    }
+
+    pub fn locate(
+        &mut self,
+        frame: &RgbImage,
+        expected: (f64, f64),
+        radius: f64,
+        token: Option<&yas::cancel::CancelToken>,
+    ) -> Result<(f64, f64)> {
+        let mini = imageops::crop_imm(frame, 64, 20, 210, 210).to_image();
+        let mut candidates: Vec<_> = self
+            .layers
+            .iter()
+            .filter(|r| {
+                let dx = r.left - expected.0;
+                let dy = r.top - expected.1;
+                let extent = if r.scale > 1.0 { 900.0 } else { 8192.0 };
+                dx > -radius && dy > -radius && dx < extent && dy < extent
+            })
+            .cloned()
+            .collect();
+        candidates.sort_by(|a, b| {
+            b.scale.total_cmp(&a.scale).then_with(|| {
+                (a.left - expected.0)
+                    .hypot(a.top - expected.1)
+                    .total_cmp(&(b.left - expected.0).hypot(b.top - expected.1))
+            })
+        });
+        let mut errors = Vec::new();
+        for layer in candidates.into_iter().take(4) {
+            ensure!(!token.is_some_and(|t| t.check_rmb()), "Mining stopped");
+            if !self.loaded.contains_key(&layer.layer_id) {
+                let path = asset(&format!(
+                    "BetterGI.Assets.Map/Assets/Map/Teyvat/{}_gray.webp",
+                    layer.layer_id
+                ))?;
+                let image = image::open(path)?.to_luma8();
+                if self.loaded.len() >= 4 {
+                    self.loaded.clear();
+                }
+                self.loaded.insert(
+                    layer.layer_id.clone(),
+                    Atlas {
+                        image,
+                        origin: (layer.left * layer.scale, layer.top * layer.scale),
+                        world_scale: layer.scale,
+                        minimum_correlation: if layer.scale > 1.0 { 0.65 } else { 0.70 },
+                    },
+                );
+            }
+            let atlas = &self.loaded[&layer.layer_id];
+            let result = atlas.locate(
+                &mini,
+                Some(expected),
+                (radius * layer.scale) as i32,
+                &self.scales,
+                true,
+                token,
+            );
+            match result {
+                Ok((x, y, _)) => return Ok((x, y)),
+                Err(error) => errors.push(format!("{}: {error}", layer.layer_id)),
+            }
+        }
+        anyhow::bail!("Surface map position unconfirmed: {}", errors.join("; "))
+    }
+}
+
+pub(super) fn estimate_camera_rotation(before: &RgbImage, after: &RgbImage) -> Result<(f64, f64)> {
+    let mut delta = [0.0; 360];
+    for (degree, value) in delta.iter_mut().enumerate() {
+        let angle = (degree as f64).to_radians();
+        for radius in 25..78 {
+            let x = (168.0 + radius as f64 * angle.cos()).round() as u32;
+            let y = (125.0 + radius as f64 * angle.sin()).round() as u32;
+            let a = before.get_pixel(x, y);
+            let b = after.get_pixel(x, y);
+            *value +=
+                (b[0] as f64 + b[1] as f64 + b[2] as f64 - a[0] as f64 - a[1] as f64 - a[2] as f64)
+                    / 3.0;
+        }
+    }
+    let mut best = (f64::NEG_INFINITY, 0, 0);
+    for shift in 5..90i32 {
+        for heading in 0..360i32 {
+            let mut score = 0.0;
+            for offset in -45..45 {
+                score += delta[(heading + offset).rem_euclid(360) as usize];
+                score -= delta[(heading - shift + offset).rem_euclid(360) as usize];
+            }
+            let normalized = score / (shift as f64).sqrt();
+            if normalized > best.0 {
+                best = (normalized, heading, shift);
+            }
+        }
+    }
+    ensure!(best.0 > 1500.0, "Camera heading could not be confirmed");
+    yas::log_debug!(
+        "挖矿镜头校准：朝向 {}，转角 {}，匹配分数 {}",
+        "Mining camera calibration: heading {}, turn {}, match score {}",
+        best.1 - best.2,
+        best.2,
+        best.0
+    );
+    Ok((
+        ((best.1 - best.2) as f64).to_radians(),
+        160.0 / best.2 as f64,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn bright_terrain_does_not_enter_or_toggle_aiming_state() {
+        let cliff = RgbImage::from_pixel(1920, 1080, image::Rgb([255, 255, 255]));
+        assert!(!aiming_active(&cliff));
+    }
+    #[test]
+    #[ignore = "requires a local map or loot-notification frame"]
+    fn read_visible_text_rows() {
+        let frame = image::open(std::env::var("GGSCANNER_MINING_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let ocr = crate::scanner::common::ocr_factory::create_ocr_model("ppocrv4").unwrap();
+        for (x, y, w, h) in [(1310, 170, 530, 760), (140, 370, 360, 340)] {
+            for (top, height) in text_rows(&frame, x, y, w, h) {
+                let text = ocr
+                    .image_to_text(
+                        &imageops::crop_imm(&frame, x, top, w, height).to_image(),
+                        false,
+                    )
+                    .unwrap();
+                println!("{x},{top},{w},{height}: {text}");
+            }
+        }
+    }
+    #[test]
+    fn camera_probe_does_not_confuse_turn_size_with_heading() {
+        for heading in [30.0_f64, 130.0, 350.0] {
+            let scene = |angle: f64| {
+                RgbImage::from_fn(300, 240, |x, y| {
+                    let theta = (y as f64 - 125.0)
+                        .atan2(x as f64 - 168.0)
+                        .to_degrees()
+                        .rem_euclid(360.0);
+                    let difference = (theta - angle + 180.0).rem_euclid(360.0) - 180.0;
+                    let terrain = ((x * 3 + y * 7) % 20) as u8 + 50;
+                    let value = terrain + if difference.abs() < 45.0 { 60 } else { 0 };
+                    image::Rgb([value, value, value])
+                })
+            };
+            let (actual, sensitivity) = estimate_camera_rotation(
+                &scene(heading),
+                &scene((heading + 22.0).rem_euclid(360.0)),
+            )
+            .unwrap();
+            let error = (actual.to_degrees() - heading + 180.0).rem_euclid(360.0) - 180.0;
+            assert!(
+                error.abs() < 3.0,
+                "Expected {heading}, got {}",
+                actual.to_degrees()
+            );
+            assert!((sensitivity - 160.0 / 22.0).abs() < 0.7);
+        }
+    }
+    #[test]
+    #[ignore = "requires a local landing frame and route"]
+    fn localize_route_landing() {
+        let frame = image::open(std::env::var("GGSCANNER_MINING_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let route = super::super::Route::parse(
+            &std::fs::read(std::env::var("GGSCANNER_MINING_ROUTE_FILE").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let point = &route.positions[0];
+        let mut locator = MiniMapLocator::new().unwrap();
+        let position = locator
+            .locate(
+                &frame,
+                (point.x, point.y),
+                std::env::var("GGSCANNER_MINING_RADIUS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(60.0),
+                None,
+            )
+            .unwrap();
+        println!(
+            "Landing position {position:?}; anchor ({},{})",
+            point.x, point.y
+        );
+        assert!((position.0 - point.x).hypot(position.1 - point.y) < 30.0);
+    }
+    #[test]
+    #[ignore = "requires a running HDR game window"]
+    fn capture_controller_party() {
+        crate::scanner::common::pixel_profile::set_hdr_mode(true);
+        let info = crate::cli::GoodScannerApplication::get_game_info().unwrap();
+        println!("Window {:?}", info.window);
+        let ctrl = crate::scanner::common::game_controller::GenshinGameController::new(
+            info,
+            yas::capture::CaptureMethod::Wgc,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let frame = ctrl.capture_game().unwrap();
+        println!("Frame {:?}", frame.dimensions());
+        frame.save("data/mining/controller-frame.png").unwrap();
+        let ocr = crate::scanner::common::ocr_factory::create_ocr_model("ppocrv4").unwrap();
+        for slot in 0..4 {
+            let text = ocr
+                .image_to_text(
+                    &imageops::crop_imm(&frame, 1640, 240 + slot * 92, 145, 45).to_image(),
+                    false,
+                )
+                .unwrap();
+            println!("Slot {slot}: {text}");
+        }
+    }
+    #[test]
+    #[ignore = "requires a local game frame"]
+    fn read_party_names() {
+        let frame = image::open(std::env::var("GGSCANNER_MINING_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        for backend in ["ppocrv4", "ppocrv5", "ppocrv6tiny"] {
+            let ocr = crate::scanner::common::ocr_factory::create_ocr_model(backend).unwrap();
+            for (x, y, w, h) in [
+                (1640, 424, 145, 45),
+                (1640, 443, 130, 28),
+                (1660, 442, 115, 30),
+                (1665, 445, 100, 22),
+            ] {
+                let text = ocr
+                    .image_to_text(&imageops::crop_imm(&frame, x, y, w, h).to_image(), false)
+                    .unwrap();
+                println!("{backend} {x},{y},{w},{h}: {text}");
+            }
+        }
+    }
+    #[test]
+    #[ignore = "requires a local game frame and downloads the pinned model"]
+    fn recognize_local_frame() {
+        let path = std::env::var("GGSCANNER_MINING_FRAME").expect("GGSCANNER_MINING_FRAME");
+        let frame = image::open(path).unwrap().to_rgb8();
+        let mut detector = OreDetector::new().unwrap();
+        let ores = detector.detect(&frame).unwrap();
+        println!("Detected ore: {ores:?}");
+        assert!(
+            !ores.is_empty(),
+            "The supplied positive frame must contain ore"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local map frame and pinned atlas"]
+    fn localize_game_map() {
+        let path = std::env::var("GGSCANNER_MINING_MAP_FRAME").expect("GGSCANNER_MINING_MAP_FRAME");
+        let frame = image::open(path).unwrap().to_rgb8();
+        let atlas = Atlas::new().unwrap();
+        let patch = imageops::crop_imm(&frame, 660, 330, 600, 420).to_image();
+        let found = atlas
+            .locate(&patch, None, 10000, &big_map_scales(), false, None)
+            .unwrap();
+        println!("Map center and scale: {found:?}");
+        if let Ok(path) = std::env::var("GGSCANNER_MINING_FRAME") {
+            let frame = image::open(path).unwrap().to_rgb8();
+            let mini = imageops::crop_imm(&frame, 64, 20, 210, 210).to_image();
+            let scales: Vec<_> = (75..=95).map(|n| n as f64 / 200.0).collect();
+            let location = atlas
+                .locate(&mini, Some((found.0, found.1)), 200, &scales, true, None)
+                .unwrap();
+            println!("Mini-map position and scale: {location:?}");
+        }
+    }
+
+    #[test]
+    fn localizes_a_map_crop() {
+        let atlas = Atlas {
+            image: GrayImage::from_fn(300, 300, |x, y| {
+                image::Luma([((x * x + 3 * y * y + 7 * x * y) % 251) as u8])
+            }),
+            origin: (4096.0, 3072.0),
+            world_scale: 0.25,
+            minimum_correlation: 0.55,
+        };
+        let crop = imageops::crop_imm(&atlas.image, 95, 115, 42, 42).to_image();
+        let rgb = image::DynamicImage::ImageLuma8(crop).to_rgb8();
+        let expected = atlas_to_world(116.0, 136.0);
+        let found = atlas
+            .locate(&rgb, Some(expected), 15, &[1.0], true, None)
+            .unwrap();
+        assert!((found.0 - expected.0).abs() < 0.01 && (found.1 - expected.1).abs() < 0.01);
+    }
+    #[test]
+    fn world_coordinate_round_trip() {
+        for p in [(0.0, 0.0), (9511.085, 1483.8521), (-1000.0, 500.0)] {
+            let a = world_to_atlas(p.0, p.1);
+            let w = atlas_to_world(a.0, a.1);
+            assert!((w.0 - p.0).abs() < 0.001 && (w.1 - p.1).abs() < 0.001);
+        }
+    }
+}

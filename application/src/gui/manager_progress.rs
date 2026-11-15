@@ -34,6 +34,7 @@ pub fn show(
         .map(|p| p.total)
         .unwrap_or(0);
     let mut text = match kind {
+        Some(JobKind::Mining) => lang.t("挖矿请求", "Mining request").to_owned(),
         Some(JobKind::Manage { lock, unlock }) => match lang {
             Lang::Zh => format!("{} · 锁定 {lock} / 解锁 {unlock}", "加解锁请求"),
             Lang::En => format!("{} · {lock} lock / {unlock} unlock", "Lock / unlock"),
@@ -62,6 +63,21 @@ pub fn show(
         TaskStatus::Running(super::state::UiText::new(&text, &text))
     };
     theme::task_status(ui, lang, Some(&feedback), "");
+    if let Some(mining) = &job.mining {
+        ui.label(super::mining_tab::route_label(&mining.route, lang));
+        ui.label(format!(
+            "{} / {}",
+            mining.completed_points, mining.total_points
+        ));
+        ui.label(lang.t(
+            "在挖矿页查看路线与收获。",
+            "Open Mining to view the route and collected ore.",
+        ));
+        if let Some(error) = &mining.error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        return;
+    }
     if let Some(scan) = job.scan_progress.as_ref().or(job.ui.scan_progress.as_ref()) {
         for (key, zh, en, phase) in [
             ("characters", "角色", "Characters", &scan.characters),

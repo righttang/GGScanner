@@ -37,6 +37,7 @@ impl Default for Game {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ToolTab {
+    Mining,
     Scanner,
     Manager,
     Capture,
@@ -86,6 +87,11 @@ impl Default for GameNavigation {
 }
 impl GameNavigation {
     pub fn active_tab(&self) -> ToolTab {
+        if self.selected_tab == ToolTab::Mining
+            && (self.active_game != Game::Genshin || !cfg!(target_os = "windows"))
+        {
+            return ToolTab::Scanner;
+        }
         self.selected_tab.available_for_build()
     }
     pub fn select_tab(&mut self, tab: ToolTab) {

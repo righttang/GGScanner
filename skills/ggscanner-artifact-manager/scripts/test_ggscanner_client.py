@@ -1,5 +1,6 @@
 """Offline tests: no live game or scanner is contacted."""
 import json
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,21 @@ from unittest.mock import patch
 import ggscanner_client as client
 
 class ClientTests(unittest.TestCase):
+    def test_mining_library_is_read_without_a_job_id(self):
+        with patch.object(client,'transport',return_value=(200,[])) as call,patch('sys.stdout',new_callable=io.StringIO):
+            client.main(['mining-routes'])
+        self.assertEqual(call.call_args.args[1:3],('/mining/routes',None))
+
+    def test_mining_timeout_records_request_and_does_not_retry(self):
+        body={'routeIds':['local-route']}
+        with tempfile.TemporaryDirectory() as directory,patch.object(client,'transport',side_effect=OSError('connection lost')) as call:
+            with self.assertRaisesRegex(RuntimeError,'Outcome unknown'):
+                client.mutate('http://localhost:18765','/mining/start',body,directory)
+            self.assertEqual(call.call_count,1)
+            records=list(Path(directory).glob('*.json'))
+            self.assertEqual(len(records),1)
+            self.assertEqual(json.loads(records[0].read_text())['request'],body)
+
     def test_loopback_only(self):
         for value in ['http://127.0.0.1:18765','http://localhost:1234','http://[::1]:18765']:
             self.assertEqual(client.base_url(value),value)

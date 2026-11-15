@@ -45,6 +45,7 @@ fn main() -> eframe::Result {
     let tab = match args.tab.as_str() {
         "scanner" => ToolTab::Scanner,
         "manager" => ToolTab::Manager,
+        "mining" => ToolTab::Mining,
         "capture" => ToolTab::Capture,
         "about" => ToolTab::Credits,
         _ => panic!("unsupported tab"),

@@ -5,6 +5,47 @@ pub struct WindowsSystemControl {
 }
 
 impl WindowsSystemControl {
+    pub fn middle_button(&mut self, pressed: bool) -> anyhow::Result<()> {
+        if pressed {
+            self.enigo.mouse_down(MouseButton::Middle);
+        } else {
+            self.enigo.mouse_up(MouseButton::Middle);
+        }
+        Ok(())
+    }
+    pub fn mouse_move_relative(&mut self, x: i32, y: i32) -> anyhow::Result<()> {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT,
+        };
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: x,
+                    dy: y,
+                    mouseData: 0,
+                    dwFlags: MOUSEEVENTF_MOVE,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        anyhow::ensure!(
+            unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) } == 1,
+            "Relative mouse input failed"
+        );
+        Ok(())
+    }
+
+    pub fn left_button(&mut self, pressed: bool) -> anyhow::Result<()> {
+        if pressed {
+            self.enigo.mouse_down(MouseButton::Left);
+        } else {
+            self.enigo.mouse_up(MouseButton::Left);
+        }
+        Ok(())
+    }
+
     pub fn new() -> WindowsSystemControl {
         WindowsSystemControl {
             enigo: Enigo::new(),
@@ -65,7 +106,7 @@ impl WindowsSystemControl {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
             SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT,
         };
-        let mut input = INPUT {
+        let input = INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
                 mi: MOUSEINPUT {

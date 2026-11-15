@@ -23,8 +23,10 @@ use yas::{log_error, log_info, log_warn};
 
 mod game_input;
 mod local_scan;
+mod mining;
 pub use game_input::{ClickFeedback, ClickRequest, OcrReading, OcrRegion};
 pub use local_scan::{record_scan_count, record_scan_phase, LocalScanClient, LocalScanSlot};
+pub use mining::library as mining_library;
 
 use crate::cli::{GoodUserConfig, ScanCoreConfig};
 use crate::manager::models::*;
@@ -133,6 +135,7 @@ enum JobRequest {
 }
 
 enum ExecutionRequest {
+    Mining(crate::mining::MiningRequest),
     Job(JobRequest),
     Input(game_input::InputTask),
     LocalScan(local_scan::LocalScanTask),
@@ -889,7 +892,9 @@ where
             };
             let cors_ref = cors_origin.as_deref();
 
-            if url.starts_with("/input/") && !game_input::local_origin_only(cors_ref) {
+            if (url.starts_with("/input/") || url.starts_with("/mining/"))
+                && !game_input::local_origin_only(cors_ref)
+            {
                 respond_error(
                     request,
                     403,
@@ -919,6 +924,19 @@ where
             }
 
             match (method, url.as_str()) {
+                (Method::Post, "/mining/start") => {
+                    mining::handle_start(
+                        request,
+                        &http_state,
+                        &http_cancel,
+                        &http_job_tx,
+                        &http_enabled,
+                        cors_ref,
+                    );
+                },
+                (method, path) if path.starts_with("/mining/routes") => {
+                    mining::handle_library(request, method, path.to_owned(), cors_origin.clone());
+                },
                 (Method::Post, "/input/key") => {
                     game_input::handle_key(
                         request,
@@ -1021,6 +1039,10 @@ where
                                             "Job not found.",
                                             cors_ref,
                                         );
+                                    } else if let Some(ref result) = state.mining {
+                                        let json = serde_json::to_string(result).unwrap();
+                                        drop(state);
+                                        respond_json(request, 200, &json, cors_ref);
                                     } else if let Some(ref result) = state.result {
                                         match serde_json::to_string(result) {
                                             Ok(json) => {
@@ -1155,6 +1177,47 @@ where
             break;
         }
         let request = match request {
+            ExecutionRequest::Mining(request) => {
+                executor = None;
+                let token = local_scan::cancel_token(&active_cancel, &job_id);
+                let progress_state = job_state.clone();
+                let report = crate::mining::runtime::execute(request, token, &|report| {
+                    let mut state = progress_state.lock().unwrap();
+                    state.progress = Some(JobProgress {
+                        completed: report.completed_points,
+                        total: report.total_points,
+                        current_id: report.route.clone(),
+                        phase: report.phase.clone(),
+                    });
+                    state.mining = Some(report.clone());
+                });
+                let save_report = (|| -> Result<()> {
+                    crate::mining::routes::write_cache(
+                        std::path::Path::new("data/mining/last-report.json"),
+                        &serde_json::to_vec_pretty(&report)?,
+                    )
+                })();
+                if let Err(error) = save_report {
+                    log_warn!(
+                        "挖矿结果无法保存到本地：{}",
+                        "The mining report could not be saved locally: {}",
+                        error
+                    );
+                }
+                let status = if report.stopped {
+                    InstructionStatus::Aborted
+                } else if report.error.is_some() {
+                    InstructionStatus::UiError
+                } else {
+                    InstructionStatus::Success
+                };
+                let results = vec![InstructionResult::outcome("mining", status)];
+                let summary = ManageSummary::from_results(&results);
+                let mut state = job_state.lock().unwrap();
+                *state = state.finished(job_id, ManageResult { results, summary });
+                state.mining = Some(report);
+                continue;
+            },
             ExecutionRequest::Shutdown => break,
             ExecutionRequest::Job(request) => request,
             ExecutionRequest::LocalScan(task) => {

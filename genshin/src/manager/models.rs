@@ -342,6 +342,8 @@ pub struct ScanProgress {
 /// Exactly one of the two is `Some` while the job is running.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mining: Option<crate::mining::MiningReport>,
     /// Native UI metadata never changes the HTTP response or persisted data.
     #[serde(skip)]
     pub ui: JobUiState,
@@ -358,6 +360,7 @@ pub struct JobState {
 
 #[derive(Debug, Clone)]
 pub enum JobKind {
+    Mining,
     Manage { lock: usize, unlock: usize },
     Equip,
     Scan,
@@ -373,6 +376,7 @@ pub struct JobUiState {
 impl JobState {
     pub fn idle() -> Self {
         Self {
+            mining: None,
             ui: JobUiState::default(),
             state: JobPhase::Idle,
             job_id: None,
@@ -385,6 +389,7 @@ impl JobState {
     /// Running state for manage/equip — linear progress.
     pub fn running(job_id: String, total: usize) -> Self {
         Self {
+            mining: None,
             ui: JobUiState::default(),
             state: JobPhase::Running,
             job_id: Some(job_id),
@@ -435,6 +440,7 @@ impl JobState {
                 kind: Some(JobKind::Scan),
                 ..Default::default()
             },
+            mining: None,
             state: JobPhase::Running,
             job_id: Some(job_id),
             progress: None,
@@ -445,6 +451,7 @@ impl JobState {
 
     pub fn completed(job_id: String, result: ManageResult) -> Self {
         Self {
+            mining: None,
             ui: JobUiState::default(),
             state: JobPhase::Completed,
             job_id: Some(job_id),
@@ -486,6 +493,15 @@ impl JobState {
     ///
     /// 轻量级 JSON 用于轮询——不包含完整结果。完整结果通过 GET /result 获取。
     pub fn status_json(&self) -> String {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&self.status_json_base()).expect("valid job status");
+        if let Some(mining) = &self.mining {
+            value["mining"] = serde_json::to_value(mining).expect("serializable mining report");
+        }
+        value.to_string()
+    }
+
+    fn status_json_base(&self) -> String {
         // jobId is always a UUID v4 (hex + hyphens), safe to embed directly.
         match self.state {
             JobPhase::Idle => r#"{"state":"idle"}"#.to_string(),

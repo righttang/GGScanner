@@ -245,7 +245,14 @@ pub fn sidebar(
                         (ToolTab::Capture, "抓包器", "Capture", Icon::Capture),
                         (ToolTab::Scanner, "扫描器", "Scanner", Icon::Scan),
                         (ToolTab::Manager, "管理器", "Manager", Icon::Manager),
+                        (ToolTab::Mining, "挖矿", "Mining", Icon::Scan),
                     ] {
+                        if value == ToolTab::Mining
+                            && (navigation.active_game != Game::Genshin
+                                || !cfg!(target_os = "windows"))
+                        {
+                            continue;
+                        }
                         if value == ToolTab::Capture
                             && !cfg!(all(feature = "capture", target_os = "windows"))
                         {

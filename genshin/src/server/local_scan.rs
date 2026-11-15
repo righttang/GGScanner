@@ -1,5 +1,6 @@
 //! In-process GUI scans use the same execution queue as HTTP jobs.
 use super::*;
+use anyhow::Context;
 
 pub type LocalScanSlot = Arc<Mutex<Option<LocalScanClient>>>;
 pub(super) type ActiveCancel = Arc<Mutex<Option<(String, yas::cancel::CancelToken)>>>;
@@ -62,6 +63,22 @@ impl LocalScanClient {
     pub fn is_stopping(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
     }
+
+    pub fn stop_job(&self, id: &str) -> Result<bool> {
+        stop_job(&self.state, &self.active, id).context("The requested job was not found")
+    }
+}
+
+fn stop_job(state: &Mutex<JobState>, active: &ActiveCancel, id: &str) -> Option<bool> {
+    let current = state.lock().unwrap();
+    if current.job_id.as_deref() != Some(id) {
+        return None;
+    }
+    let running = current.state == JobPhase::Running;
+    if running {
+        cancel_token(active, id).cancel(yas::cancel::StopReason::UserAbort);
+    }
+    Some(running)
 }
 
 pub(super) fn cancel_token(active: &ActiveCancel, id: &str) -> yas::cancel::CancelToken {
@@ -150,8 +167,7 @@ pub(super) fn handle_stop(
         );
         return;
     };
-    let current = state.lock().unwrap();
-    if current.job_id.as_deref() != Some(parsed.job_id.as_str()) {
+    let Some(running) = stop_job(state, active, &parsed.job_id) else {
         respond_error(
             request,
             404,
@@ -160,12 +176,7 @@ pub(super) fn handle_stop(
             origin,
         );
         return;
-    }
-    let running = current.state == JobPhase::Running;
-    if running {
-        cancel_token(active, &parsed.job_id).cancel(yas::cancel::StopReason::UserAbort);
-    }
-    drop(current);
+    };
     respond_json(
         request,
         200,

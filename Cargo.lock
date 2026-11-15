@@ -1923,6 +1923,8 @@ dependencies = [
  "lazy_static",
  "libloading",
  "log",
+ "ndarray",
+ "ort",
  "pktmon",
  "protobuf",
  "rayon",

@@ -1,6 +1,6 @@
 ---
 name: ggscanner-artifact-manager
-description: Use GGScanner and GGArtifact to scan Genshin inventory, plan independent artifact loadouts, apply equipment and party presets, and manage authorized enhancement or forging budgets. Use for account gear management rather than scanner development.
+description: Use GGScanner to scan and manage Genshin gear, apply GGArtifact loadouts and party presets, manage authorized enhancement or forging budgets, or run its native Linnea mining routes. Use for account operations rather than scanner development.
 ---
 
 # GGScanner 圣遗物整理
@@ -23,13 +23,14 @@ Windows HDR与扫描设置一致。启停见仓库 `docs/WINDOWS_LOCAL_CONTROL.m
 
 - 扫描、独立分配、培养和核验：读 [inventory-workflow.md](references/inventory-workflow.md)。
 - 接口、去重、移动与现场：读 [game-api.md](references/game-api.md)。
+- 莉奈娅地表挖矿：读 [game-api.md 的挖矿流程](references/game-api.md#挖矿)。
 - 体力与后续培养建议：读 [resin-planning.md](references/resin-planning.md)。
 - [ggscanner_client.py](scripts/ggscanner_client.py) 在POST前保存请求及结果；
   `--dry-run`不操作游戏，`--help`提供示例。
 
 ## 执行约束
 
-1. 扫描、穿戴、锁定与输入共享队列。不同时开另一套鼠标脚本；停止用当前jobId，
+1. 扫描、穿戴、锁定、挖矿与输入共享队列。不同时开另一套鼠标脚本；停止用当前jobId，
    等终态后才发下一项。健康、状态与停止可在任务中查询。
 2. 资源操作先落台账再提交，按实际累计预算。重塑保留旧结果也计一次。
    分阶段强化再评价，不自动把全部候选拉满。

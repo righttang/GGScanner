@@ -15,9 +15,12 @@ import uuid
 from pathlib import Path
 
 GET = {'health':'/health','status':'/status','result':'/result','input-result':'/input/result',
-       'characters':'/characters','weapons':'/weapons','artifacts':'/artifacts'}
+       'characters':'/characters','weapons':'/weapons','artifacts':'/artifacts',
+       'mining-routes':'/mining/routes'}
 POST = {'scan':'/scan','equip':'/equip','manage':'/manage','click':'/input/click',
-        'key':'/input/key','stop':'/stop'}
+        'key':'/input/key','stop':'/stop','mine':'/mining/start',
+        'mining-refresh':'/mining/routes/refresh','mining-download':'/mining/routes/download',
+        'mining-import':'/mining/routes/import'}
 
 def base_url(value):
     url = urllib.parse.urlsplit(value)
@@ -111,14 +114,14 @@ def main(argv=None):
     if args.action in GET:
         endpoint=GET[args.action]
         if args.argument:endpoint+='?'+urllib.parse.urlencode({'jobId':args.argument})
-        elif args.action not in {'health','status','artifacts'}:parser.error('jobId required')
+        elif args.action not in {'health','status','artifacts','mining-routes'}:parser.error('jobId required')
         if args.dry_run:result={'dryRun':True,'endpoint':endpoint}
         else:
             status,result=transport(base,endpoint,None,args.transport)
             if status>=400:raise RuntimeError(f'HTTP {status}: {json.dumps(result,ensure_ascii=False)}')
     else:
-        if not args.argument:parser.error('JSON file or stop jobId required')
-        body={'jobId':args.argument} if args.action=='stop' else json.loads(Path(args.argument).read_text(encoding='utf-8-sig'))
+        if not args.argument and args.action!='mining-refresh':parser.error('JSON file or stop jobId required')
+        body={} if args.action=='mining-refresh' else {'jobId':args.argument} if args.action=='stop' else json.loads(Path(args.argument).read_text(encoding='utf-8-sig'))
         result=mutate(base,POST[args.action],body,args.ledger,args.transport,args.dry_run)
     print(json.dumps(result,ensure_ascii=False,indent=2))
 

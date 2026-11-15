@@ -6,6 +6,40 @@ The application defaults to filtering the requested artifact sets and stops
 management once all targets are matched. Management does not refresh full
 inventory; use `POST /scan` (including the recent-artifacts mode) to read data.
 
+## Local mining
+
+Windows clients can run Linnea surface mining through the same execution queue
+as scans, equip operations and game input. `/mining/*` accepts native local
+clients and loopback browser origins. Native Mining controls use the same
+admission and execution queue directly within the application.
+
+- `GET /mining/routes` returns the cached route library.
+- `POST /mining/routes/refresh` refreshes the BetterGI community Linnea catalog.
+- `POST /mining/routes/download` with `{"id":"..."}` downloads and validates a route.
+- `POST /mining/routes/import` with `{"path":"C:\\routes"}` imports JSON files or a directory.
+- `POST /mining/start` with `{"routeIds":["..."]}` runs downloaded compatible routes once, in request order. It returns HTTP 202 and `{"jobId":"..."}`. Competing operations return 409.
+- `POST /mining/start` with `{"routeIds":[],"stationary":true}` tests one ore cluster at the current position.
+
+Routes must start at a teleport and use Teyvat surface coordinates. Supported
+movement is walk/run/dash, with path/target/orientation points and linnea_mining
+actions. Orientation points turn the camera without moving toward the target.
+Unsupported actions are reported with their waypoint number before admission.
+Initial in-game validation covers the community G09 and G11 surface routes.
+Other compatible imports should be tested locally before a longer run.
+The active party must contain Linnea. The runtime recognizes and selects her
+existing party slot. Acquisition counts require readable game notifications.
+Fired arrows without confirmed acquisition are reported as `unconfirmed`.
+
+`GET /status` adds `mining` for mining jobs, including phase, route, waypoint,
+completedPoints, totalPoints, shots, point outcomes, confirmed loot, error and
+stopped. `GET /result?jobId=...` returns the final mining report for that job.
+Use the existing `POST /stop` with its current jobId to cancel. Focus loss also
+ends execution. Held movement keys and mouse buttons are released on exit.
+Route/model/map downloads are cached under `data/mining`. Mining does not save
+continuous screenshots. The latest summary is atomically saved to
+`data/mining/last-report.json`. Up to three failure screenshots are overwritten
+in that directory. Community route author/revision metadata remains local.
+
 ## Security
 
 **Origin-based CORS**: The server only accepts requests from allowed origins.

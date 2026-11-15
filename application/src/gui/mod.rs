@@ -15,6 +15,7 @@ pub mod log_bridge;
 pub mod log_panel;
 pub mod manager_progress;
 pub mod manager_tab;
+mod mining_tab;
 #[cfg(feature = "dev-tools")]
 pub mod preview;
 mod privilege;
@@ -164,6 +165,7 @@ fn run_gui_with_agent_mode(agent_mode: bool) {
                 app_config,
                 &cc.egui_ctx,
                 agent_mode,
+                true,
                 #[cfg(target_os = "linux")]
                 linux_theme::spawn_theme_watcher(cc.egui_ctx.clone()),
             )))
@@ -257,6 +259,7 @@ fn install_panic_hook() {
 }
 
 struct GuiApp {
+    mining: mining_tab::MiningUi,
     save_settings: bool,
     splits: layout::Splits,
     logos: shell::Logos,
@@ -283,6 +286,7 @@ impl GuiApp {
         app_config: ApplicationConfigStore,
         ctx: &egui::Context,
         agent_mode: bool,
+        start_services: bool,
         #[cfg(target_os = "linux")] theme_rx: Option<
             std::sync::mpsc::Receiver<Option<egui::Theme>>,
         >,
@@ -294,6 +298,10 @@ impl GuiApp {
         let star_rail =
             star_rail_state::StarRailState::new(app_config.config.star_rail.output_dir.clone());
         let mut app = Self {
+            mining: mining_tab::MiningUi::new(
+                state.local_scans.clone(),
+                state.server_status.clone(),
+            ),
             save_settings: true,
             splits: layout::Splits::default(),
             logos: shell::Logos::load(ctx),
@@ -311,9 +319,10 @@ impl GuiApp {
             #[cfg(all(feature = "capture", target_os = "windows"))]
             capture_tab: capture_tab_state,
         };
-        if agent_mode
-            || (cfg!(target_os = "windows")
-                && app.app_config.config.navigation.active_game == Game::Genshin)
+        if start_services
+            && (agent_mode
+                || (cfg!(target_os = "windows")
+                    && app.app_config.config.navigation.active_game == Game::Genshin))
         {
             app.start_agent_manager(agent_mode);
         }
@@ -612,6 +621,9 @@ impl eframe::App for GuiApp {
                     }
                     layout::workspace(ui, &mut self.splits.settings, |ui, pane| {
                         let owns_running_task = match (active_game, active_tab) {
+                            (Game::Genshin, ToolTab::Mining) => {
+                                self.state.server_job.lock().unwrap().mining.is_some()
+                            },
                             (Game::Genshin, ToolTab::Scanner) => is_scan_running,
                             (Game::Genshin, ToolTab::Manager) => is_server_running,
                             (Game::Genshin, ToolTab::Capture) => is_capture_busy,
@@ -632,13 +644,16 @@ impl eframe::App for GuiApp {
                                 && !data_refreshing
                                 && !update_in_progress)
                         {
-                            let running_tab = if is_server_running || star_rail_manager_running {
-                                ToolTab::Manager
-                            } else if is_scan_running || star_rail_scan_running {
-                                ToolTab::Scanner
-                            } else {
-                                ToolTab::Capture
-                            };
+                            let running_tab =
+                                if self.state.server_job.lock().unwrap().mining.is_some() {
+                                    ToolTab::Mining
+                                } else if is_server_running || star_rail_manager_running {
+                                    ToolTab::Manager
+                                } else if is_scan_running || star_rail_scan_running {
+                                    ToolTab::Scanner
+                                } else {
+                                    ToolTab::Capture
+                                };
                             let reason = if data_refreshing {
                                 l.t("正在更新游戏数据", "Updating game data")
                             } else if update_in_progress {
@@ -660,6 +675,21 @@ impl eframe::App for GuiApp {
                             return;
                         }
                         match (active_game, active_tab, pane) {
+                            (Game::Genshin, ToolTab::Mining, layout::Pane::Settings) => {
+                                self.mining.settings(
+                                    ui,
+                                    l,
+                                    restart_required
+                                        || is_scan_running
+                                        || is_capture_busy
+                                        || star_rail_busy
+                                        || update_in_progress
+                                        || server_busy,
+                                );
+                            },
+                            (Game::Genshin, ToolTab::Mining, layout::Pane::Status) => {
+                                self.mining.status(ui, l, &self.state.server_job);
+                            },
                             (Game::Genshin, ToolTab::Scanner, layout::Pane::Settings) => {
                                 ui.add_enabled_ui(
                                     !restart_required

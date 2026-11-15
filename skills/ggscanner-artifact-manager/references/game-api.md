@@ -17,6 +17,27 @@ Skill 后可读 [在线规范](https://github.com/righttang/GGScanner/blob/main/
 202仅表示已接受。409可能是忙碌或 ID 冲突，先读状态与回执。不同时运行其他
 鼠标脚本，不用任意另一个任务的结果充当本次证据。
 
+## 挖矿
+
+由 Scanner 在本机执行。当前支持 Windows、莉奈娅和提瓦特地表路线，当前出战
+队伍须包含莉奈娅。用本机界面的“挖矿”页，或以下高层接口；执行期间只查询状态，
+不要另发移动、瞄准或射击脚本。
+
+- `GET /mining/routes` 读取路线 ID、作者、缓存状态和不支持的点位。
+- `POST /mining/routes/refresh` 用 `{}` 更新社区目录；`/download` 用 `{"id":"..."}`
+  下载并检查，`/import` 用 `{"path":"C:\\routes"}` 导入本地 JSON 或文件夹。
+- 只选已下载且 `issues` 为空的路线。先在矿点用
+  `POST /mining/start` 的 `{"routeIds":[],"stationary":true}` 试采；路线任务用
+  `{"routeIds":["已检查的ID"]}`，按请求顺序各运行一次。
+- 202 后轮询 `/status`，用当前 jobId 查询 `/result` 或 `/stop`。网络超时先查状态，
+  不自动重发开始请求。右键也可停止；焦点丢失会结束任务。
+- 检查每个矿点的 `outcome`、`shots`、`loot` 和 `error`。射箭不等于收获，
+  `unconfirmed` 表示未读到收获提示，`noOre` 表示未识别到矿石。需要精确总量时，
+  对比背包前后数量；提示识别可能漏读。最新报告保存在 `data/mining/last-report.json`。
+
+客户端命令 `mining-routes`、`mining-refresh`、`mining-download`、`mining-import`
+对应路线库；`mine request.json` 提交任务。普通玩家无需操作网页。
+
 ## 点击与按键
 
 `POST /input/click` 使用游戏客户区实际像素，非桌面坐标，也不会自动按1080p缩放。

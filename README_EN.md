@@ -27,6 +27,7 @@ Keep account exports and action ledgers local.
 - **Game switcher**: equal-width Genshin and Star Rail choices at the top of the window; each game keeps its own settings and current page
 - **Genshin scanning and capture**: existing Character, Weapon, Artifact, and GOOD v3 export behavior remains compatible
 - **Genshin achievement capture**: GGScanner exports the account's completed achievement IDs by default
+- **Genshin mining (Windows)**: Linnea ore detection, aiming and collection, with community surface routes and local BGI JSON import
 - **Star Rail scanning**: Characters, Light Cones, Cavern Relics, and Planar Ornaments
 - **Star Rail export and manager**: scanner and capture both write [HSR-Scanner v4](docs/HSR_EXPORT.md); Relic manager instructions still use `goodscanner.hsr.manager-instructions`
 - **Star Rail achievement capture**: GGScanner captures completed achievements in process; no separate HSR application or packet-capture helper download is required
@@ -69,6 +70,10 @@ Star Rail scanner and capture both write [HSR-Scanner v4](docs/HSR_EXPORT.md). I
 4. Star Rail settings are kept separately in `data/good_app_config.json`. The shared binaries include a verified GIlore reference snapshot; the reference-folder field is only an advanced override
 5. Make sure the selected game is running. **Right-click to abort** during scanning
 6. Genshin still writes `GOODv3.json`; choose the Star Rail output folder on its page
+
+For mining, include Linnea in the active party and open Mining. Refresh and download compatible routes,
+select them and start, or test at the current deposit. Right-click or press Stop to end the task.
+The page reports fired arrows separately from recognized acquisition notifications.
 
 The built-in Star Rail reference is the complete public GIlore `1.2.0` snapshot used to validate inventory and achievement IDs. An explicitly selected override must be a complete checksummed GIlore bundle; invalid overrides fail closed instead of falling back silently. No reference-data download is required for normal use.
 

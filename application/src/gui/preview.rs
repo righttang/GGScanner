@@ -59,6 +59,7 @@ pub fn run(
                 config,
                 &cc.egui_ctx,
                 false,
+                false,
                 #[cfg(target_os = "linux")]
                 None,
             );
@@ -177,6 +178,7 @@ pub fn run(
                 app,
                 output,
                 frames: 0,
+                started: std::time::Instant::now(),
                 click,
                 hover,
                 pressed,
@@ -199,6 +201,7 @@ struct Preview {
     app: GuiApp,
     output: PathBuf,
     frames: usize,
+    started: std::time::Instant,
     click: Option<[f32; 2]>,
     hover: Option<[f32; 2]>,
     pressed: bool,
@@ -254,7 +257,11 @@ impl eframe::App for Preview {
             )
             .expect("save native UI screenshot");
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if self.frames == if self.click.is_some() { 30 } else { 5 } {
+        } else if self.frames >= if self.click.is_some() { 30 } else { 5 }
+            && (self.app.app_config.config.navigation.active_tab() != ToolTab::Mining
+                || !self.app.mining.is_loading()
+                || self.started.elapsed() >= std::time::Duration::from_secs(15))
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
         ctx.request_repaint();

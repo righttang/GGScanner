@@ -5,6 +5,7 @@ mod data_http;
 pub mod fs_utils;
 pub mod game_data;
 pub mod manager;
+pub mod mining;
 pub mod scanner;
 pub mod server;
 pub mod updater;

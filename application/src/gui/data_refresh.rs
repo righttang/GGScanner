@@ -144,6 +144,7 @@ impl DataRefresh {
         capture_achievements: bool,
     ) {
         let title = match tab {
+            ToolTab::Mining => lang.t("挖矿", "Mining"),
             ToolTab::Capture => lang.t("抓包器", "Capture"),
             ToolTab::Scanner => lang.t("扫描器", "Scanner"),
             ToolTab::Manager => lang.t("管理器", "Manager"),
