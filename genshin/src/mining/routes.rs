@@ -8,7 +8,8 @@ use std::{
 };
 
 const REPOSITORY: &str = "https://api.github.com/repos/babalae/bettergi-scripts-list";
-const ROUTE_DIR: &str = "repo/pathing/矿物/莉奈娅一条龙";
+const MINERAL_DIR: &str = "repo/pathing/矿物";
+const COLLECTIONS: &[&str] = &["莉奈娅一条龙", "虹滴晶", "萃凝晶"];
 const LIMIT: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,7 +18,7 @@ pub struct Route {
     pub positions: Vec<Waypoint>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteInfo {
     pub name: String,
     #[serde(default)]
@@ -26,6 +27,12 @@ pub struct RouteInfo {
     pub map_name: String,
     #[serde(default, alias = "mapMatchMethod")]
     pub map_match_method: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub environment: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +77,56 @@ impl Waypoint {
 }
 
 impl Route {
+    pub fn environment(&self) -> &str {
+        if !self.info.environment.is_empty() {
+            return &self.info.environment;
+        }
+        if self.info.name.contains("水下") || self.info.description.contains("螃蟹技能") {
+            "underwater"
+        } else if self.info.name.contains("地下") {
+            "underground"
+        } else {
+            "ground"
+        }
+    }
+    fn source_hint(&mut self, path: &str) {
+        if self.info.environment.is_empty() {
+            if path.contains("水下") {
+                self.info.environment = "underwater".into();
+            } else if path.contains("地下") {
+                self.info.environment = "underground".into();
+            }
+        }
+    }
+    pub fn required_capabilities(&self) -> Vec<String> {
+        let mut capabilities = std::collections::BTreeSet::<String>::new();
+        capabilities.insert(self.environment().into());
+        for p in &self.positions {
+            capabilities.insert(
+                match p.move_mode.as_str() {
+                    "fly" => "glide",
+                    "climb" => "climb",
+                    "swim" => "swim",
+                    "jump" => "jump",
+                    _ => "ground",
+                }
+                .into(),
+            );
+            if !p.action.is_empty() {
+                capabilities.insert(p.action.clone());
+            }
+            if p.action == "combat_script" {
+                if let Ok(actions) = super::actions::parse_script(&p.action_params) {
+                    for action in actions {
+                        if let super::actions::Action::Select { role } = action {
+                            capabilities.insert(format!("role:{}", role.name()));
+                        }
+                    }
+                }
+            }
+        }
+        capabilities.into_iter().collect()
+    }
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         ensure!(bytes.len() as u64 <= LIMIT, "Route exceeds 5 MiB");
         let route: Self =
@@ -92,19 +149,59 @@ impl Route {
 
     pub fn issues(&self) -> Vec<String> {
         let mut issues = Vec::new();
-        if !matches!(self.info.map_name.as_str(), "" | "Teyvat") || self.info.name.contains("地下")
-        {
-            issues.push("Teyvat surface routes only".into());
+        if !matches!(self.info.map_name.as_str(), "" | "Teyvat") {
+            issues.push(format!("Unsupported map: {}", self.info.map_name));
+        }
+        if self.environment() != "ground" {
+            issues.push(format!(
+                "Navigation capability pending: {}",
+                self.environment()
+            ));
         }
         if self.positions[0].kind != "teleport" {
             issues.push("First waypoint must be a teleport".into());
         }
         for (index, p) in self.positions.iter().enumerate() {
+            if p.action == "combat_script" {
+                match super::actions::parse_script(&p.action_params) {
+                    Err(error) => {
+                        issues.push(format!("Waypoint {}: {error}", index + 1));
+                        continue;
+                    },
+                    Ok(actions) => {
+                        let mut role = None;
+                        for action in actions {
+                            match action {
+                                super::actions::Action::Select { role: selected } => {
+                                    role = Some(selected)
+                                },
+                                super::actions::Action::Hold {
+                                    key: super::actions::GameKey::Skill,
+                                    ..
+                                } => {
+                                    if role == Some(super::actions::Role::Zhongli) {
+                                        issues.push(format!(
+                                            "Waypoint {}: Mining capability pending: nearbyPickup",
+                                            index + 1
+                                        ));
+                                    } else if role == Some(super::actions::Role::Mavuika) {
+                                        issues.push(format!(
+                                            "Waypoint {}: Navigation capability pending: vehicle",
+                                            index + 1
+                                        ));
+                                    }
+                                },
+                                _ => {},
+                            }
+                        }
+                    },
+                }
+            }
             let valid = matches!(
                 p.kind.as_str(),
                 "teleport" | "path" | "target" | "orientation"
             ) && matches!(p.move_mode.as_str(), "walk" | "run" | "dash")
-                && matches!(p.action.as_str(), "" | "linnea_mining")
+                && matches!(p.action.as_str(), "" | "linnea_mining" | "combat_script")
                 && (p.action != "linnea_mining" || p.shots().is_ok())
                 && (p.action != "" || p.action_params.is_empty());
             if !valid {
@@ -122,7 +219,7 @@ impl Route {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteEntry {
     pub id: String,
@@ -134,6 +231,68 @@ pub struct RouteEntry {
     pub points: usize,
     #[serde(default)]
     pub source_path: Option<String>,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+fn category(path: &str) -> &'static str {
+    if path.contains("/萃凝晶/") {
+        "condessenceCrystal"
+    } else if path.contains("/虹滴晶/") {
+        "rainbowdropCrystal"
+    } else if path.contains("/莉奈娅一条龙/") {
+        "linnea"
+    } else {
+        "local"
+    }
+}
+fn region(text: &str) -> &'static str {
+    for (name, key) in [
+        ("枫丹", "fontaine"),
+        ("纳塔", "natlan"),
+        ("挪德卡莱", "nodKrai"),
+        ("蒙德", "mondstadt"),
+        ("璃月", "liyue"),
+        ("稻妻", "inazuma"),
+        ("须弥", "sumeru"),
+        ("至冬", "snezhnaya"),
+    ] {
+        if text.contains(name) {
+            return key;
+        }
+    }
+    "other"
+}
+fn community_path(path: &str) -> bool {
+    path.ends_with(".json")
+        && !path.contains('\\')
+        && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
+        && COLLECTIONS
+            .iter()
+            .any(|collection| path.starts_with(&format!("{MINERAL_DIR}/{collection}/")))
+}
+impl RouteEntry {
+    fn inspect(&mut self, route: &Route) {
+        self.name = route.info.name.clone();
+        self.authors = route.info.authors.iter().map(|a| a.name.clone()).collect();
+        self.issues = route.issues();
+        self.points = route.positions.len();
+        self.capabilities = route.required_capabilities();
+        self.source_metadata();
+    }
+    fn source_metadata(&mut self) {
+        let path = self.source_path.as_deref().unwrap_or("");
+        if self.category.is_empty() {
+            self.category = category(path).into();
+        }
+        if self.region.is_empty() {
+            self.region = region(&format!("{path}/{}", self.name)).into();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -172,8 +331,14 @@ impl RouteStore {
         for entry in &mut entries {
             entry.downloaded = self.path(&entry.id)?.is_file();
             if entry.downloaded {
-                entry.issues = self.load(&entry.id)?.issues();
+                match self.load(&entry.id) {
+                    Ok(route) => entry.inspect(&route),
+                    Err(error) => {
+                        entry.issues = vec![format!("Cached route could not be read: {error}")]
+                    },
+                }
             }
+            entry.source_metadata();
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
@@ -204,7 +369,8 @@ impl RouteStore {
             .map(|p| Route::parse(&std::fs::read(p)?).with_context(|| p.display().to_string()))
             .collect::<Result<Vec<_>>>()?;
         let mut entries = self.list()?;
-        for route in routes {
+        for (mut route, path) in routes.into_iter().zip(&paths) {
+            route.source_hint(&path.to_string_lossy());
             let id = uuid::Uuid::new_v4().to_string();
             self.save_route(&id, &route)?;
             entries.push(RouteEntry {
@@ -216,6 +382,9 @@ impl RouteStore {
                 issues: route.issues(),
                 points: route.positions.len(),
                 source_path: None,
+                category: category(&path.to_string_lossy().replace('\\', "/")).into(),
+                region: region(&format!("{}/{}", path.display(), route.info.name)).into(),
+                capabilities: route.required_capabilities(),
             });
         }
         self.save_list(&entries)?;
@@ -234,7 +403,7 @@ impl RouteStore {
         let mut url = reqwest::Url::parse(&format!("{REPOSITORY}/contents/"))?;
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("Invalid catalog URL"))?
-            .extend(ROUTE_DIR.split('/'));
+            .extend(MINERAL_DIR.split('/'));
         url.query_pairs_mut().append_pair("ref", revision);
         let listing: Vec<serde_json::Value> = serde_json::from_slice(&download(url.as_str())?)?;
         let old = self.list()?;
@@ -245,25 +414,58 @@ impl RouteStore {
             .filter(|(_, r)| r.source_path.is_none())
             .map(|(id, r)| (id.clone(), r.clone()))
             .collect();
-        for file in listing {
-            let name = file["name"].as_str().unwrap_or("");
-            if !name.ends_with(".json") {
+        for collection in COLLECTIONS {
+            let Some(folder) = listing
+                .iter()
+                .find(|file| file["name"].as_str() == Some(collection))
+            else {
                 continue;
+            };
+            let sha = folder["sha"]
+                .as_str()
+                .context("Missing collection tree ID")?;
+            ensure!(
+                sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_hexdigit()),
+                "Invalid collection tree ID"
+            );
+            let tree: serde_json::Value = serde_json::from_slice(&download(&format!(
+                "{REPOSITORY}/git/trees/{sha}?recursive=1"
+            ))?)?;
+            ensure!(
+                tree["truncated"].as_bool() != Some(true),
+                "Community collection tree was truncated"
+            );
+            for file in tree["tree"].as_array().context("Missing collection tree")? {
+                let relative = file["path"].as_str().unwrap_or("");
+                let source = format!("{MINERAL_DIR}/{collection}/{relative}");
+                if file["type"] != "blob" || !community_path(&source) {
+                    continue;
+                }
+                let sha = file["sha"].as_str().context("Missing route blob ID")?;
+                ensure!(
+                    sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_hexdigit()),
+                    "Invalid route blob ID"
+                );
+                let id = format!("community-{sha}");
+                if entries.contains_key(&id) {
+                    continue;
+                }
+                let mut entry = previous.remove(&id).unwrap_or(RouteEntry {
+                    id: id.clone(),
+                    name: relative
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(relative)
+                        .trim_end_matches(".json")
+                        .into(),
+                    source_path: Some(source.clone()),
+                    ..Default::default()
+                });
+                entry.revision = revision.into();
+                entry.source_path = Some(source);
+                entry.source_metadata();
+                entries.insert(id, entry);
             }
-            let sha = file["sha"].as_str().context("Missing route blob ID")?;
-            let id = format!("community-{sha}");
-            let mut entry = previous.remove(&id).unwrap_or(RouteEntry {
-                id: id.clone(),
-                name: name.trim_end_matches(".json").into(),
-                authors: Vec::new(),
-                revision: revision.into(),
-                downloaded: false,
-                issues: Vec::new(),
-                points: 0,
-                source_path: Some(format!("{ROUTE_DIR}/{name}")),
-            });
-            entry.revision = revision.into();
-            entries.insert(id, entry);
         }
         let entries: Vec<_> = entries.into_values().collect();
         self.save_list(&entries)?;
@@ -277,10 +479,7 @@ impl RouteStore {
             .context("Unknown route")?;
         if !entry.downloaded {
             let path = entry.source_path.as_deref().context("No download source")?;
-            ensure!(
-                path.starts_with(&format!("{ROUTE_DIR}/")) && !path.contains(".."),
-                "Invalid community path"
-            );
+            ensure!(community_path(path), "Invalid community path");
             let mut url = reqwest::Url::parse(
                 "https://raw.githubusercontent.com/babalae/bettergi-scripts-list/",
             )?;
@@ -288,12 +487,10 @@ impl RouteStore {
                 .unwrap()
                 .push(&entry.revision)
                 .extend(path.split('/'));
-            let route = Route::parse(&download(url.as_str())?)?;
+            let mut route = Route::parse(&download(url.as_str())?)?;
+            route.source_hint(path);
             self.save_route(id, &route)?;
-            entry.name = route.info.name.clone();
-            entry.authors = route.info.authors.iter().map(|a| a.name.clone()).collect();
-            entry.issues = route.issues();
-            entry.points = route.positions.len();
+            entry.inspect(&route);
             entry.downloaded = true;
             self.save_list(&entries)?;
         }
@@ -341,6 +538,7 @@ mod tests {
                 authors: vec![],
                 map_name: "Teyvat".into(),
                 map_match_method: "TemplateMatch".into(),
+                ..Default::default()
             },
             positions: vec![
                 Waypoint {
@@ -365,13 +563,20 @@ mod tests {
         }
     }
     #[test]
-    fn validate_orientation_and_reject_scripts() {
+    fn validates_supported_actions_and_rejects_unknown_scripts() {
         assert!(route("orientation", "linnea_mining", "2,4")
             .issues()
             .is_empty());
-        assert!(!route("path", "combat_script", "wait(3)")
+        assert!(route("path", "combat_script", "wait(3)")
             .issues()
             .is_empty());
+        assert!(!route("path", "combat_script", "execute(system)")
+            .issues()
+            .is_empty());
+        assert!(route("path", "combat_script", "钟离 e(hold)")
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("nearbyPickup")));
         assert!(!route("path", "linnea_mining", "2.2").issues().is_empty());
         assert_eq!(
             route("orientation", "linnea_mining", "3,1").positions[1]
@@ -384,5 +589,69 @@ mod tests {
     fn route_ids_cannot_escape_store() {
         let store = RouteStore::default();
         assert!(store.load("../secret").is_err());
+    }
+    #[test]
+    fn classifies_nested_catalogs_and_rejects_paths_outside_collections() {
+        let path = "repo/pathing/矿物/萃凝晶/枫丹水下@作者/A01.json";
+        assert!(community_path(path));
+        assert_eq!(category(path), "condessenceCrystal");
+        assert_eq!(region(path), "fontaine");
+        for path in [
+            "repo/js/example.json",
+            "repo/pathing/矿物/萃凝晶/../secret.json",
+            "repo/pathing/矿物/萃凝晶/README.md",
+            "repo/pathing/矿物/萃凝晶/a\\b.json",
+        ] {
+            assert!(!community_path(path), "{path}");
+        }
+    }
+    #[test]
+    fn underwater_context_survives_serialization_and_is_not_admitted_as_ground() {
+        let mut route = route("path", "combat_script", "wait(3)");
+        route.source_hint("repo/pathing/矿物/萃凝晶/枫丹水下/A01.json");
+        let round_trip = Route::parse(&serde_json::to_vec(&route).unwrap()).unwrap();
+        assert_eq!(round_trip.environment(), "underwater");
+        assert!(round_trip
+            .required_capabilities()
+            .contains(&"underwater".into()));
+        assert!(round_trip
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("underwater")));
+    }
+    #[test]
+    fn malformed_cached_route_does_not_hide_other_routes() {
+        let root = std::env::temp_dir().join(format!("ggscanner-mining-{}", uuid::Uuid::new_v4()));
+        let store = RouteStore::new(root.clone());
+        let good = route("path", "combat_script", "wait(3)");
+        store.save_route("valid", &good).unwrap();
+        write_cache(&store.path("broken").unwrap(), b"not json").unwrap();
+        store
+            .save_list(&[
+                RouteEntry {
+                    id: "valid".into(),
+                    ..Default::default()
+                },
+                RouteEntry {
+                    id: "broken".into(),
+                    ..Default::default()
+                },
+            ])
+            .unwrap();
+        let entries = store.list().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .find(|e| e.id == "valid")
+            .unwrap()
+            .issues
+            .is_empty());
+        assert!(entries.iter().find(|e| e.id == "broken").unwrap().issues[0]
+            .contains("could not be read"));
+        std::fs::remove_file(store.path("valid").unwrap()).unwrap();
+        std::fs::remove_file(store.path("broken").unwrap()).unwrap();
+        std::fs::remove_file(root.join("catalog.json")).unwrap();
+        std::fs::remove_dir(root.join("routes")).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 }

@@ -197,6 +197,34 @@ fn mini_map_overlay_mask(query: &RgbImage) -> GrayImage {
     mask
 }
 
+/// Avoid starting a pan on an anchor or character marker, whose UI can consume
+/// the press instead of initiating a map drag.
+pub(super) fn map_drag_origin(frame: &RgbImage) -> (f64, f64) {
+    let candidates = [
+        (1050u32, 650u32),
+        (1200, 700),
+        (800, 750),
+        (600, 700),
+        (1100, 800),
+    ];
+    let &(x, y) = candidates
+        .iter()
+        .min_by_key(|&&(cx, cy)| {
+            let mut markers = 0;
+            for y in cy - 24..=cy + 24 {
+                for x in cx - 24..=cx + 24 {
+                    let p = frame.get_pixel(x, y);
+                    if p.0.iter().all(|&v| v > 190) || (p[0] < 110 && p[1] > 180 && p[2] > 180) {
+                        markers += 1;
+                    }
+                }
+            }
+            markers
+        })
+        .unwrap();
+    (x as f64, y as f64)
+}
+
 pub(super) struct Atlas {
     pub image: GrayImage,
     origin: (f64, f64),
@@ -537,6 +565,16 @@ pub(super) fn estimate_camera_rotation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn map_pan_avoids_bright_markers_at_the_drag_origin() {
+        let mut frame = RgbImage::from_pixel(1920, 1080, image::Rgb([70, 90, 100]));
+        for y in 630..=670 {
+            for x in 1030..=1070 {
+                frame.put_pixel(x, y, image::Rgb([245, 245, 245]));
+            }
+        }
+        assert_ne!(map_drag_origin(&frame), (1050.0, 650.0));
+    }
     #[test]
     fn weak_mini_map_matches_require_continuous_motion_and_cannot_confirm_teleports() {
         assert!(confirms_mini_map_match(0.620, 4.0, 20.0));

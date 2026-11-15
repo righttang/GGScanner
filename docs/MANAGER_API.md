@@ -13,8 +13,10 @@ as scans, equip operations and game input. `/mining/*` accepts native local
 clients and loopback browser origins. Native Mining controls use the same
 admission and execution queue directly within the application.
 
-- `GET /mining/routes` returns the cached route library.
-- `POST /mining/routes/refresh` refreshes the BetterGI community Linnea catalog.
+- `GET /mining/routes` returns the cached route library, including `category`,
+  `region`, `capabilities` and per-waypoint `issues`.
+- `POST /mining/routes/refresh` recursively refreshes the BetterGI Linnea,
+  Rainbowdrop Crystal and Condessence Crystal collections at a pinned commit.
 - `POST /mining/routes/download` with `{"id":"..."}` downloads and validates a route.
 - `POST /mining/routes/import` with `{"path":"C:\\routes"}` imports JSON files or a directory.
 - `POST /mining/start` with `{"routeIds":["..."]}` runs downloaded compatible routes once, in request order. It returns HTTP 202 and `{"jobId":"..."}`. Competing operations return 409.
@@ -22,12 +24,22 @@ admission and execution queue directly within the application.
 
 Routes must start at a teleport and use Teyvat surface coordinates. Supported
 movement is walk/run/dash, with path/target/orientation points and linnea_mining
-actions. Orientation points turn the camera without moving toward the target.
+actions. Bounded `combat_script` instructions support waits, relative camera
+movement, game key presses/holds, mouse clicks, attacks and selecting the fixed
+Linnea/Zhongli/Mavuika/Dehya party roles. Script parsing completes before any
+input; unknown commands/keys are rejected. Held inputs are released on success,
+error, cancellation and unwinding. Each command is limited to 30 seconds, and
+each script to 128 commands/120 seconds. Orientation points turn the camera
+without moving toward the target.
 Unsupported actions are reported with their waypoint number before admission.
+Collections can contain underwater, underground, vehicle and ordinary-mining
+routes whose runtime capability is not yet available. These remain listed with
+explicit issues; downloading or parsing is not an in-game validation result.
 Initial in-game validation covers the community G09, G10 and G11 surface routes.
 Other compatible imports should be tested locally before a longer run.
-The active party must contain Linnea. The runtime recognizes and selects her
-existing party slot. Acquisition counts require readable game notifications.
+Linnea mining requires Linnea in the active party; named script roles must also
+be present. The runtime recognizes and selects their existing party slots.
+Acquisition counts require readable game notifications.
 Fired arrows without confirmed acquisition are reported as `unconfirmed`.
 
 `GET /status` adds `mining` for mining jobs, including phase, route, waypoint,

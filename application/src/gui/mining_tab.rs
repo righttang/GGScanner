@@ -18,6 +18,9 @@ pub struct MiningUi {
     pending: Option<mpsc::Receiver<Result<serde_json::Value, String>>>,
     cancel_pending: Option<mpsc::Receiver<Result<serde_json::Value, String>>>,
     error: Option<String>,
+    category: String,
+    region: String,
+    search: String,
 }
 
 impl Default for MiningUi {
@@ -34,6 +37,9 @@ impl Default for MiningUi {
             pending: None,
             cancel_pending: None,
             error,
+            category: String::new(),
+            region: String::new(),
+            search: String::new(),
         }
     }
 }
@@ -189,12 +195,79 @@ impl MiningUi {
             }
         });
         ui.separator();
+        let mut filter_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt("mining-category")
+                .selected_text(category_label(&self.category, l))
+                .show_ui(ui, |ui| {
+                    for value in [
+                        "",
+                        "linnea",
+                        "rainbowdropCrystal",
+                        "condessenceCrystal",
+                        "local",
+                    ] {
+                        filter_changed |= ui
+                            .selectable_value(
+                                &mut self.category,
+                                value.into(),
+                                category_label(value, l),
+                            )
+                            .changed();
+                    }
+                });
+            egui::ComboBox::from_id_salt("mining-region")
+                .selected_text(region_label(&self.region, l))
+                .show_ui(ui, |ui| {
+                    for value in [
+                        "",
+                        "fontaine",
+                        "natlan",
+                        "nodKrai",
+                        "mondstadt",
+                        "liyue",
+                        "inazuma",
+                        "sumeru",
+                        "snezhnaya",
+                        "other",
+                    ] {
+                        filter_changed |= ui
+                            .selectable_value(
+                                &mut self.region,
+                                value.into(),
+                                region_label(value, l),
+                            )
+                            .changed();
+                    }
+                });
+            filter_changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .desired_width(150.0)
+                        .hint_text(l.t("搜索路线", "Search routes")),
+                )
+                .changed();
+            if ui.button(l.t("清除选择", "Clear selection")).clicked() {
+                self.selected.clear();
+            }
+        });
+        if filter_changed {
+            self.selected.retain(|id| {
+                self.entries.iter().any(|entry| {
+                    &entry.id == id
+                        && matches_filter(entry, &self.category, &self.region, &self.search)
+                })
+            });
+        }
         let mut download = None;
         egui::ScrollArea::vertical()
             .id_salt("mining-routes")
             .max_height((ui.available_height() - 150.0).clamp(80.0, 360.0))
             .show(ui, |ui| {
                 for entry in &self.entries {
+                    if !matches_filter(entry, &self.category, &self.region, &self.search) {
+                        continue;
+                    }
                     ui.horizontal_wrapped(|ui| {
                         let mut selected = self.selected.contains(&entry.id);
                         if ui
@@ -224,6 +297,12 @@ impl MiningUi {
                     if !entry.authors.is_empty() {
                         ui.small(entry.authors.join(", "));
                     }
+                    if entry.downloaded && entry.issues.is_empty() {
+                        ui.small(l.t(
+                            "动作检查通过；实机结果请查看任务报告",
+                            "Action checks passed; see task reports for in-game results",
+                        ));
+                    }
                     for issue in &entry.issues {
                         let issue = match issue.as_str() {
                             "Teyvat surface routes only" => {
@@ -231,6 +310,12 @@ impl MiningUi {
                             },
                             "First waypoint must be a teleport" => {
                                 l.t("首点须为传送点", "First waypoint must be a teleport")
+                            },
+                            "Navigation capability pending: underwater" => {
+                                l.t("水下导航待接入", "Underwater navigation pending")
+                            },
+                            "Navigation capability pending: underground" => {
+                                l.t("地下导航待接入", "Underground navigation pending")
                             },
                             other => other,
                         };
@@ -246,7 +331,7 @@ impl MiningUi {
             );
         }
         ui.separator();
-        ui.label(l.t("当前出战队伍须包含莉奈娅。按列表顺序运行，每条一次。鼠标右键或停止按钮可终止。","The active party needs Linnea. Run once in list order. Right-click or press Stop to cancel."));
+        ui.label(l.t("请按路线要求携带采矿角色。按列表顺序运行，每条一次。鼠标右键或停止按钮可终止。","Bring the characters required by each route. Run once in list order. Right-click or press Stop to cancel."));
         if ui
             .add_enabled(
                 !blocked && self.pending.is_none() && !self.selected.is_empty(),
@@ -328,6 +413,7 @@ impl MiningUi {
             "loadingModels" => l.t("加载模型与地图", "Loading models and map"),
             "teleporting" => l.t("传送", "Teleporting"),
             "moving" => l.t("跑线", "Moving"),
+            "executingAction" => l.t("执行路线动作", "Executing route action"),
             "searchingOre" => l.t("寻找矿石", "Searching for ore"),
             "aiming" => l.t("瞄准", "Aiming"),
             "shooting" => l.t("射击并确认收获", "Shooting and checking loot"),
@@ -388,5 +474,60 @@ pub(super) fn route_label(route: &str, lang: Lang) -> &str {
         lang.t("单点测试", "Stationary test")
     } else {
         route
+    }
+}
+
+fn matches_filter(entry: &RouteEntry, category: &str, region: &str, search: &str) -> bool {
+    (category.is_empty() || entry.category == category)
+        && (region.is_empty() || entry.region == region)
+        && (search.trim().is_empty()
+            || entry
+                .name
+                .to_lowercase()
+                .contains(&search.trim().to_lowercase()))
+}
+fn category_label(category: &str, l: Lang) -> &'static str {
+    match category {
+        "linnea" => l.t("莉奈娅综合路线", "Linnea routes"),
+        "rainbowdropCrystal" => l.t("虹滴晶", "Rainbowdrop Crystal"),
+        "condessenceCrystal" => l.t("萃凝晶", "Condessence Crystal"),
+        "local" => l.t("本地路线", "Local routes"),
+        _ => l.t("全部矿种", "All categories"),
+    }
+}
+fn region_label(region: &str, l: Lang) -> &'static str {
+    match region {
+        "fontaine" => l.t("枫丹", "Fontaine"),
+        "natlan" => l.t("纳塔", "Natlan"),
+        "nodKrai" => l.t("挪德卡莱", "Nod-Krai"),
+        "mondstadt" => l.t("蒙德", "Mondstadt"),
+        "liyue" => l.t("璃月", "Liyue"),
+        "inazuma" => l.t("稻妻", "Inazuma"),
+        "sumeru" => l.t("须弥", "Sumeru"),
+        "snezhnaya" => l.t("至冬", "Snezhnaya"),
+        "other" => l.t("其他地区", "Other regions"),
+        _ => l.t("全部地区", "All regions"),
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    #[test]
+    fn resource_region_and_search_filters_combine() {
+        let route = RouteEntry {
+            name: "中央实验室基地东".into(),
+            category: "condessenceCrystal".into(),
+            region: "fontaine".into(),
+            ..Default::default()
+        };
+        assert!(matches_filter(
+            &route,
+            "condessenceCrystal",
+            "fontaine",
+            " 实验室 "
+        ));
+        assert!(!matches_filter(&route, "rainbowdropCrystal", "", ""));
+        assert!(!matches_filter(&route, "", "natlan", ""));
     }
 }

@@ -129,6 +129,7 @@ pub fn execute(
 
 #[cfg(windows)]
 mod windows {
+    use super::super::actions::{self, ActionDriver, Button, GameKey, Role};
     use super::super::navigation::{TeleportAnchor, TeleportCatalog};
     use super::super::vision::{Atlas, MiniMapLocator, OreDetector};
     use super::*;
@@ -149,6 +150,8 @@ mod windows {
         ocr: Box<dyn ImageToText<RgbImage> + Send>,
         sight_refreshed: Option<Instant>,
         aiming: bool,
+        selected_role: Option<Role>,
+        script_deadline: Option<Instant>,
     }
     impl Drop for Game<'_> {
         fn drop(&mut self) {
@@ -175,6 +178,11 @@ mod windows {
         }
         fn check(&self) -> Result<()> {
             ensure!(!self.token.check_rmb(), "Mining stopped");
+            ensure!(
+                self.script_deadline
+                    .is_none_or(|deadline| Instant::now() < deadline),
+                "Route action script exceeded 120 seconds"
+            );
             ensure!(
                 self.ctrl.game_info.native_window().is_foreground(),
                 "Game window lost focus"
@@ -261,7 +269,10 @@ mod windows {
             );
             Ok(frame)
         }
-        fn linnea(&mut self) -> Result<()> {
+        fn select_role(&mut self, role: Role) -> Result<()> {
+            if self.selected_role == Some(role) {
+                return Ok(());
+            }
             let mut names = Vec::new();
             for _ in 0..3 {
                 self.wait(400)?;
@@ -269,9 +280,10 @@ mod windows {
                 names.clear();
                 for slot in 0..4 {
                     let name = self.read(&frame, 1640, 259 + slot * 92, 130, 28)?;
-                    if name.contains("莉奈") || name.contains("莉奈婭") {
+                    if role.matches(&name) {
                         self.key(Key::Layout(char::from(b'1' + slot as u8)))?;
                         self.wait(800)?;
+                        self.selected_role = Some(role);
                         return Ok(());
                     }
                     names.push(name);
@@ -279,7 +291,45 @@ mod windows {
             }
             std::fs::create_dir_all("data/mining").ok();
             self.frame()?.save("data/mining/last-failure.png").ok();
-            anyhow::bail!("Active party needs Linnea. Observed names: {names:?}")
+            anyhow::bail!(
+                "Active party needs {}. Observed names: {names:?}",
+                role.name()
+            )
+        }
+    }
+
+    impl ActionDriver for Game<'_> {
+        fn select(&mut self, role: Role) -> Result<()> {
+            self.select_role(role)
+        }
+        fn wait(&mut self, milliseconds: u64) -> Result<()> {
+            Game::wait(self, milliseconds)
+        }
+        fn move_camera(&mut self, x: i32, y: i32) -> Result<()> {
+            self.rotate(x as f64, y as f64)
+        }
+        fn press(&mut self, key: GameKey) -> Result<()> {
+            if matches!(key, GameKey::Slot(_)) {
+                self.selected_role = None;
+            }
+            self.key(key.native())
+        }
+        fn key_state(&mut self, key: GameKey, down: bool) -> Result<()> {
+            if down {
+                self.check()?;
+                self.ctrl.system_control.key_down(key.native())
+            } else {
+                self.ctrl.system_control.key_up(key.native())
+            }
+        }
+        fn button_state(&mut self, button: Button, down: bool) -> Result<()> {
+            if down {
+                self.check()?;
+            }
+            match button {
+                Button::Left => self.ctrl.system_control.left_button(down),
+                Button::Middle => self.ctrl.system_control.middle_button(down),
+            }
         }
     }
 
@@ -326,12 +376,23 @@ mod windows {
             ocr: ocr_factory::create_ocr_model("ppocrv4")?,
             sight_refreshed: None,
             aiming: false,
+            selected_role: None,
+            script_deadline: None,
         };
         game.check()?;
         if !game.ctrl.return_to_main_ui(3) {
             anyhow::bail!("Could not return to the main world");
         }
-        game.linnea()?;
+        if request.stationary
+            || routes.iter().any(|route| {
+                route
+                    .positions
+                    .iter()
+                    .any(|point| point.action == "linnea_mining")
+            })
+        {
+            game.select_role(Role::Linnea)?;
+        }
         if request.stationary {
             report.route = "stationary".into();
             report.waypoint = 1;
@@ -381,9 +442,21 @@ mod windows {
                         point.move_mode != "walk",
                     )?);
                 }
-                if point.action == "linnea_mining" {
-                    let (shots, rounds) = point.shots()?;
-                    mine(&mut game, &mut detector, shots, rounds, progress, report)?;
+                match point.action.as_str() {
+                    "linnea_mining" => {
+                        let (shots, rounds) = point.shots()?;
+                        mine(&mut game, &mut detector, shots, rounds, progress, report)?;
+                    },
+                    "combat_script" => {
+                        report.phase = "executingAction".into();
+                        progress(report);
+                        game.script_deadline = Some(Instant::now() + Duration::from_secs(120));
+                        let result = actions::execute_script(&mut game, &point.action_params);
+                        game.script_deadline = None;
+                        result?;
+                    },
+                    "" => {},
+                    other => anyhow::bail!("Unsupported route action: {other}"),
                 }
                 report.completed_points += 1;
                 progress(report);
@@ -558,6 +631,7 @@ mod windows {
             ensure!(selected, "Map region {region} could not be selected");
         }
         // Match the map's center against the atlas at several supported zooms.
+        let mut pan_trace = Vec::new();
         for _ in 0..40 {
             let frame = game.frame()?;
             let patch = imageops::crop_imm(&frame, 660, 330, 600, 420).to_image();
@@ -571,6 +645,7 @@ mod windows {
             )?;
             let screen_x = 960.0 + (x - map_target.0) * 0.25 / scale;
             let screen_y = 540.0 + (y - map_target.1) * 0.25 / scale;
+            pan_trace.push(serde_json::json!({"center":[x,y],"scale":scale,"target":map_target,"screen":[screen_x,screen_y]}));
             if (120.0..1700.0).contains(&screen_x) && (150.0..900.0).contains(&screen_y) {
                 game.click(screen_x, screen_y)?;
                 game.wait(600)?;
@@ -610,8 +685,9 @@ mod windows {
             let dx = (960.0 - screen_x).clamp(-600.0, 600.0);
             let dy = (540.0 - screen_y).clamp(-300.0, 300.0);
             let origin = game.ctrl.game_info.window.origin();
-            let sx = game.ctrl.scaler.scale_x(960.0) as i32 + origin.x;
-            let sy = game.ctrl.scaler.scale_y(540.0) as i32 + origin.y;
+            let (drag_x, drag_y) = super::super::vision::map_drag_origin(&frame);
+            let sx = game.ctrl.scaler.scale_x(drag_x) as i32 + origin.x;
+            let sy = game.ctrl.scaler.scale_y(drag_y) as i32 + origin.y;
             game.ctrl.system_control.mouse_drag(
                 sx,
                 sy,
@@ -619,6 +695,12 @@ mod windows {
                 sy + game.ctrl.scaler.scale_y(dy) as i32,
             )?;
             game.wait(500)?;
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&pan_trace) {
+            let _ = super::super::routes::write_cache(
+                std::path::Path::new("data/mining/last-map-projection.json"),
+                &bytes,
+            );
         }
         anyhow::bail!("Target anchor could not be reached on the map")
     }
@@ -631,6 +713,7 @@ mod windows {
         progress: &MiningProgress<'_>,
         report: &mut MiningReport,
     ) -> Result<()> {
+        game.select_role(Role::Linnea)?;
         report.phase = "searchingOre".into();
         progress(report);
         game.aiming = super::super::vision::aiming_active(&game.frame()?);
