@@ -14,27 +14,33 @@ pub(super) enum Motion {
 pub(super) const UNDERWATER_SKILL_X: u32 = 1780;
 
 pub(super) fn vehicle_active(frame: &RgbImage) -> bool {
-    // Mavuika's mounted HUD adds the orange T dismount/change control.
-    // The E cooldown alone also changes after an ordinary skill press.
-    let mut orange = 0;
-    let mut keycap = 0;
-    for y in 952..1022 {
-        for x in 1460..1540 {
-            let p = frame.get_pixel(x, y);
-            if p[0] > 190 && p[1] > 55 && p[1] < 190 && p[2] < 100 {
-                orange += 1;
+    // Binary shape descriptor of the mounted E (dismount) glyph. The optional
+    // T prompt can disappear while riding, and cannot establish this state.
+    // Only HUD geometry is retained; no account/game-world image is embedded.
+    const GLYPH: [u16; 12] = [0, 0, 0, 0, 24, 48, 48, 112, 496, 248, 240, 96];
+    let mut intersection = 0;
+    let mut union = 0;
+    for (row, expected) in GLYPH.into_iter().enumerate() {
+        let mut observed = 0u16;
+        for column in 0..14 {
+            let x = 1680 + column * 4;
+            let y = 962 + row as u32 * 4;
+            let white = (y..y + 2)
+                .flat_map(|yy| (x..x + 2).map(move |xx| (xx, yy)))
+                .filter(|&(xx, yy)| {
+                    let p = frame.get_pixel(xx, yy).0;
+                    *p.iter().min().unwrap() > 210
+                        && p.iter().max().unwrap() - p.iter().min().unwrap() < 35
+                })
+                .count();
+            if white >= 3 {
+                observed |= 1 << column;
             }
         }
+        intersection += (observed & expected).count_ones();
+        union += (observed | expected).count_ones();
     }
-    for y in 1028..1050 {
-        for x in 1488..1512 {
-            let p = frame.get_pixel(x, y);
-            if p.0.iter().all(|&v| v > 210) {
-                keycap += 1;
-            }
-        }
-    }
-    orange > 250 && keycap > 200
+    union > 0 && intersection as f64 / union as f64 >= 0.72
 }
 
 pub(super) struct MotionDetector {
@@ -84,9 +90,13 @@ impl MotionDetector {
         ))
     }
     pub fn borrowed_skill_present(&self, frame: &RgbImage) -> bool {
-        let area = imageops::grayscale(
-            &imageops::crop_imm(frame, UNDERWATER_SKILL_X, 1018, 74, 40).to_image(),
-        );
+        self.skill_key_present(frame, UNDERWATER_SKILL_X)
+    }
+    pub fn ground_skill_present(&self, frame: &RgbImage) -> bool {
+        self.skill_key_present(frame, 1680)
+    }
+    fn skill_key_present(&self, frame: &RgbImage, x: u32) -> bool {
+        let area = imageops::grayscale(&imageops::crop_imm(frame, x, 1018, 74, 40).to_image());
         match_glyph(&area, &self.skill_key) >= 0.84
     }
     pub fn observe(&self, frame: &RgbImage, labels: &str) -> Motion {
@@ -167,6 +177,31 @@ pub(super) fn save_crab_reference(frame: &RgbImage) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vehicle_requires_shape_not_brightness() {
+        assert!(!vehicle_active(&RgbImage::from_pixel(
+            1920,
+            1080,
+            image::Rgb([255, 255, 255])
+        )));
+        assert!(!vehicle_active(&RgbImage::from_pixel(
+            1920,
+            1080,
+            image::Rgb([255, 120, 10])
+        )));
+    }
+    #[test]
+    #[ignore = "requires a local landing or non-ground HUD frame"]
+    fn verify_local_landing_frame() {
+        let frame = image::open(std::env::var("GGSCANNER_MOTION_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let detector = MotionDetector::new().unwrap();
+        assert_eq!(
+            detector.observe(&frame, "") == Motion::Ground && detector.ground_skill_present(&frame),
+            std::env::var("GGSCANNER_EXPECT_GROUND").unwrap() == "true"
+        );
+    }
     #[test]
     #[ignore = "requires a local game frame"]
     fn verify_local_vehicle_frame() {

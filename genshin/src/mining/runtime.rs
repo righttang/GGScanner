@@ -364,6 +364,27 @@ mod windows {
                 role.name()
             )
         }
+        fn confirm_vehicle(&mut self, expected: bool) -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stable = 0;
+            self.wait(250)?;
+            while Instant::now() < deadline {
+                if super::super::motion::vehicle_active(&self.frame()?) == expected {
+                    stable += 1;
+                    if stable >= 2 {
+                        return Ok(());
+                    }
+                } else {
+                    stable = 0;
+                }
+                self.wait(150)?;
+            }
+            anyhow::bail!(if expected {
+                "Mavuika vehicle HUD could not be confirmed"
+            } else {
+                "Mavuika vehicle exit could not be confirmed"
+            })
+        }
         fn record_loot(&mut self, frame: &RgbImage, report: &mut MiningReport) -> Result<bool> {
             let mut visible = std::collections::BTreeMap::new();
             for (top, height) in super::super::vision::text_rows(frame, 140, 370, 360, 340) {
@@ -434,11 +455,7 @@ mod windows {
                 }
             ) && self.selected_role == Some(Role::Mavuika)
             {
-                self.wait(500)?;
-                ensure!(
-                    super::super::motion::vehicle_active(&self.frame()?),
-                    "Mavuika vehicle HUD could not be confirmed"
-                );
+                self.confirm_vehicle(true)?;
                 self.vehicle = true;
             }
             if self.vehicle
@@ -449,11 +466,7 @@ mod windows {
                     }
                 )
             {
-                self.wait(350)?;
-                ensure!(
-                    !super::super::motion::vehicle_active(&self.frame()?),
-                    "Mavuika vehicle exit could not be confirmed"
-                );
+                self.confirm_vehicle(false)?;
                 self.vehicle = false;
             }
             Ok(())
@@ -932,6 +945,7 @@ mod windows {
         let mut recovery_used = false;
         let mut last_heading: Option<f64> = None;
         let mut since_face = 0;
+        let mut glide_finished = false;
         if mode == "fly" {
             for _ in 0..8 {
                 if game.motion()? == Motion::Gliding {
@@ -965,9 +979,19 @@ mod windows {
                 since_face = 0;
             }
             since_face += 1;
-            if mode == "fly" {
+            if mode == "fly" && !glide_finished {
+                if motion == Motion::Ground
+                    && distance < 8.0
+                    && game.motion.ground_skill_present(&game.frame()?)
+                {
+                    glide_finished = true;
+                    yas::log_info!(
+                        "已在目标附近落地，改为步行接近",
+                        "Landed near target; finishing approach on foot"
+                    );
+                }
                 ensure!(
-                    motion == Motion::Gliding,
+                    glide_finished || motion == Motion::Gliding,
                     "Gliding ended before the waypoint"
                 );
             }
@@ -1188,8 +1212,7 @@ mod windows {
         while Instant::now() < deadline {
             game.wait(300)?;
             let frame = game.frame()?;
-            let key = game.read(&frame, 1680, 1018, 72, 46)?;
-            if game.motion()? == Motion::Ground && key.to_ascii_uppercase().contains('E') {
+            if game.motion()? == Motion::Ground && game.motion.ground_skill_present(&frame) {
                 let since = grounded.get_or_insert_with(Instant::now);
                 if since.elapsed() >= Duration::from_millis(1500) {
                     return Ok(());
