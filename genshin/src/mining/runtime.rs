@@ -97,13 +97,19 @@ pub type MiningProgress<'a> = dyn Fn(&MiningReport) + 'a;
 struct MovementProgress {
     anchor: (f64, f64),
     unchanged: usize,
+    target: (f64, f64),
+    closest: f64,
+    not_closer: usize,
 }
 
 impl MovementProgress {
-    fn new(position: (f64, f64)) -> Self {
+    fn new(position: (f64, f64), target: (f64, f64)) -> Self {
         Self {
             anchor: position,
             unchanged: 0,
+            target,
+            closest: (position.0 - target.0).hypot(position.1 - target.1),
+            not_closer: 0,
         }
     }
     fn observe(&mut self, position: (f64, f64)) -> Result<()> {
@@ -114,6 +120,17 @@ impl MovementProgress {
             self.unchanged += 1;
         }
         ensure!(self.unchanged < 8, "Character is stuck near the waypoint");
+        let distance = (position.0 - self.target.0).hypot(position.1 - self.target.1);
+        if distance < self.closest - 0.5 {
+            self.closest = distance;
+            self.not_closer = 0;
+        } else {
+            self.not_closer += 1;
+        }
+        ensure!(
+            self.not_closer < 10,
+            "Movement is not approaching the waypoint"
+        );
         Ok(())
     }
 }
@@ -189,7 +206,10 @@ mod windows {
             let _ = self.ctrl.system_control.left_button(false);
             let _ = self.ctrl.system_control.middle_button(false);
             self.leave_aim();
-            if self.ctrl.game_info.native_window().is_foreground() {
+            if self.vehicle
+                && self.selected_role == Some(Role::Mavuika)
+                && self.ctrl.game_info.native_window().is_foreground()
+            {
                 if let Ok(frame) = self.ctrl.capture_game() {
                     let frame = imageops::resize(&frame, 1920, 1080, FilterType::Triangle);
                     if super::super::motion::vehicle_active(&frame) {
@@ -266,7 +286,13 @@ mod windows {
         }
         fn motion(&self) -> Result<Motion> {
             let frame = self.frame()?;
-            let labels = self.read(&frame, 1510, 1008, 350, 60)?;
+            // Read keycaps separately; a wide crop merges Ctrl, Space and the
+            // scene/UID into an unreliable line of text.
+            let labels = format!(
+                "{} {}",
+                self.read(&frame, 1560, 1024, 100, 34)?,
+                self.read(&frame, 1660, 1024, 100, 34)?
+            );
             Ok(self.motion.observe(&frame, &labels))
         }
         fn click(&mut self, x: f64, y: f64) -> Result<()> {
@@ -363,7 +389,12 @@ mod windows {
                 }
             } else {
                 let frame = self.frame()?;
-                let text = self.read(&frame, 1680, 938, 74, 70)?;
+                let x = if self.underwater_route {
+                    super::super::motion::UNDERWATER_SKILL_X
+                } else {
+                    1680
+                };
+                let text = self.read(&frame, x, 938, 74, 70)?;
                 let digits: String = text
                     .chars()
                     .filter(|c| c.is_ascii_digit() || *c == '.')
@@ -383,6 +414,10 @@ mod windows {
                     "Underwater skill requires a confirmed underwater HUD"
                 );
                 self.wait_skill(Role::Dehya)?;
+                ensure!(
+                    self.motion.borrowed_skill_present(&self.frame()?),
+                    "No borrowed underwater E skill is visible"
+                );
                 ensure!(super::super::motion::crab_reference_matches(&self.frame()?)?,"Armored crab skill is unconfirmed; run the A00 acquisition route and calibrate its visible skill icon first");
             }
             Ok(())
@@ -435,15 +470,42 @@ mod windows {
         fn press(&mut self, key: GameKey) -> Result<()> {
             if key == GameKey::Skill {
                 self.check_underwater_skill()?;
+                if !self.underwater_route
+                    && !self.vehicle
+                    && self.selected_role == Some(Role::Mavuika)
+                {
+                    self.wait_skill(Role::Mavuika)?;
+                }
             }
             if matches!(key, GameKey::Slot(_)) {
                 self.selected_role = None;
             }
-            self.key(key.native())
+            self.key(key.native())?;
+            if key == GameKey::Skill
+                && !self.underwater_route
+                && !self.vehicle
+                && self.selected_role == Some(Role::Mavuika)
+            {
+                self.skill_ready
+                    .insert(Role::Mavuika, Instant::now() + Duration::from_secs(16));
+            }
+            Ok(())
         }
         fn key_state(&mut self, key: GameKey, down: bool) -> Result<()> {
             if key == GameKey::Skill && down {
                 self.check_underwater_skill()?;
+            }
+            if key == GameKey::Skill
+                && self.selected_role == Some(Role::Mavuika)
+                && !self.underwater_route
+            {
+                if down && !self.vehicle {
+                    self.wait_skill(Role::Mavuika)?;
+                }
+                if !down {
+                    self.skill_ready
+                        .insert(Role::Mavuika, Instant::now() + Duration::from_secs(16));
+                }
             }
             if key == GameKey::Skill && self.selected_role == Some(Role::Zhongli) {
                 if down {
@@ -532,22 +594,29 @@ mod windows {
                 game.motion()? == Motion::Underwater,
                 "Crab skill calibration requires an underwater HUD"
             );
-            super::super::motion::save_crab_reference(&game.frame()?)?;
+            let frame = game.frame()?;
+            ensure!(
+                game.motion.borrowed_skill_present(&frame),
+                "A borrowed underwater E skill must be visible before calibration"
+            );
+            super::super::motion::save_crab_reference(&frame)?;
             report.route = "crabCalibration".into();
             report.completed_points = 1;
             return Ok(());
         }
-        if (request.stationary
+        if request.stationary {
+            game.underwater_route = game.motion()? == Motion::Underwater;
+            ensure!(
+                !game.underwater_route || request.strategy == MiningStrategy::Auto,
+                "Underwater stationary mining requires automatic strategy"
+            );
+        }
+        if request.stationary
+            && !game.underwater_route
             && matches!(
                 request.strategy,
                 MiningStrategy::Auto | MiningStrategy::Linnea
-            ))
-            || routes.iter().any(|route| {
-                route
-                    .positions
-                    .iter()
-                    .any(|point| point.action == "linnea_mining")
-            })
+            )
         {
             game.select_role(Role::Linnea)?;
         }
@@ -555,6 +624,14 @@ mod windows {
             report.route = "stationary".into();
             report.waypoint = 1;
             match request.strategy {
+                MiningStrategy::Auto if game.underwater_route => ground_mine(
+                    &mut game,
+                    &mut detector,
+                    MiningStrategy::Auto,
+                    true,
+                    progress,
+                    report,
+                )?,
                 MiningStrategy::Auto | MiningStrategy::Linnea => {
                     mine(&mut game, &mut detector, 1, 24, progress, report)?
                 },
@@ -611,6 +688,7 @@ mod windows {
                             (point.x, point.y),
                             teleports.nearest((point.x, point.y))?,
                         )?;
+                        game.selected_role = None;
                         position = Some(locate(&game, mini_locator, Some((point.x, point.y)), 50)?);
                         report.map_floor = mini_locator.last_floor;
                         let landed = position.unwrap();
@@ -667,7 +745,30 @@ mod windows {
                                     .or_else(|_|locate(&game,mini_locator,position,250))
                                     .context("Position after route movement script could not be confirmed")?);
                             }
-                            if game.underwater_route {
+                            let water_mining = game.underwater_route
+                                && parsed.iter().any(|a| {
+                                    matches!(
+                                        a,
+                                        actions::Action::Press {
+                                            key: GameKey::Skill
+                                        } | actions::Action::Hold {
+                                            key: GameKey::Skill,
+                                            ..
+                                        } | actions::Action::Down {
+                                            key: GameKey::Skill
+                                        }
+                                    )
+                                });
+                            if water_mining {
+                                finish_ground_mine(
+                                    &mut game,
+                                    "armoredCrab",
+                                    false,
+                                    initial_loot,
+                                    progress,
+                                    report,
+                                )?;
+                            } else if game.underwater_route {
                                 pickup_visible(&mut game, progress, report)?;
                                 poll_loot(&mut game, report, progress, 800)?;
                             }
@@ -827,7 +928,7 @@ mod windows {
         mode: &str,
     ) -> Result<(f64, f64)> {
         let started = Instant::now();
-        let mut movement = MovementProgress::new(current);
+        let mut movement = MovementProgress::new(current, target);
         let mut recovery_used = false;
         let mut last_heading: Option<f64> = None;
         let mut since_face = 0;
@@ -896,20 +997,29 @@ mod windows {
                         .with_context(|| format!("Target {target:?}; observed {next:?}"));
                 }
                 recovery_used = true;
-                yas::log_info!(
-                    "挖矿行进受阻，尝试一次短跳脱困",
-                    "Mining path blocked; attempting one short jump"
-                );
-                game.key(Key::Space)?;
-                game.forward(450, false)?;
-                game.wait(900)?;
+                if motion == Motion::Underwater {
+                    yas::log_info!(
+                        "水下行进受阻，尝试一次短距离上浮",
+                        "Underwater path blocked; attempting one short ascent"
+                    );
+                    actions::execute_script(game, "keydown(SPACE),w(0.6),keyup(SPACE)")?;
+                    game.wait(400)?;
+                } else {
+                    yas::log_info!(
+                        "挖矿行进受阻，尝试一次短跳脱困",
+                        "Mining path blocked; attempting one short jump"
+                    );
+                    game.key(Key::Space)?;
+                    game.forward(450, false)?;
+                    game.wait(900)?;
+                }
                 current = locate(game, mini_locator, Some(next), 20)
                     .or_else(|_| locate(game, mini_locator, Some(next), 60))?;
                 ensure!(
                     (current.0 - next.0).hypot(current.1 - next.1) < 24.0,
                     "Mini-map position jumped unexpectedly during recovery"
                 );
-                movement = MovementProgress::new(current);
+                movement = MovementProgress::new(current, target);
                 last_heading = None;
                 continue;
             }
@@ -1102,7 +1212,12 @@ mod windows {
         let mut saw_enemy = false;
         let mut clear_since = None;
         let mut last_shield = None;
+        let mut last_fire: Option<Instant> = None;
         loop {
+            ensure!(
+                started.elapsed() < Duration::from_secs(90),
+                "Combat exceeded 90 seconds; enemy clearance unconfirmed"
+            );
             let enemy = super::super::vision::enemy_health_bar(&game.frame()?);
             saw_enemy |= enemy;
             if enemy {
@@ -1139,10 +1254,6 @@ mod windows {
                     return Ok(());
                 }
             }
-            ensure!(
-                started.elapsed() < Duration::from_secs(90),
-                "Combat exceeded 90 seconds; enemy clearance unconfirmed"
-            );
             if enemy {
                 if game.underwater_route {
                     game.press(GameKey::Skill)?;
@@ -1155,6 +1266,10 @@ mod windows {
                     last_shield = Some(Instant::now());
                 }
                 game.select_role(Role::Mavuika)?;
+                if last_fire.is_none_or(|time| time.elapsed() >= Duration::from_secs(16)) {
+                    game.press(GameKey::Skill)?;
+                    last_fire = Some(Instant::now());
+                }
                 actions::execute_script(game, "attack(1.5)")?;
             } else {
                 game.wait(300)?;
@@ -1479,14 +1594,27 @@ mod tests {
     use super::*;
     #[test]
     fn small_forward_steps_accumulate_before_stuck_detection() {
-        let mut moving = MovementProgress::new((0.0, 0.0));
+        let mut moving = MovementProgress::new((0.0, 0.0), (100.0, 0.0));
         for step in 1..100 {
             assert!(moving.observe((step as f64 / 3.0, 0.0)).is_ok());
         }
-        let mut blocked = MovementProgress::new((0.0, 0.0));
+        let mut blocked = MovementProgress::new((0.0, 0.0), (100.0, 0.0));
         for _ in 0..7 {
             assert!(blocked.observe((0.1, 0.0)).is_ok());
         }
         assert!(blocked.observe((0.1, 0.0)).is_err());
+    }
+    #[test]
+    fn circling_does_not_count_as_navigation_progress() {
+        let mut progress = MovementProgress::new((10.0, 0.0), (0.0, 0.0));
+        for step in 1..10 {
+            let angle = step as f64 * 0.3;
+            assert!(progress
+                .observe((10.0 * angle.cos(), 10.0 * angle.sin()))
+                .is_ok());
+        }
+        assert!(progress
+            .observe((10.0 * 3.0f64.cos(), 10.0 * 3.0f64.sin()))
+            .is_err());
     }
 }

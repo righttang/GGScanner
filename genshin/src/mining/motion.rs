@@ -11,6 +11,7 @@ pub(super) enum Motion {
     Climbing,
     Underwater,
 }
+pub(super) const UNDERWATER_SKILL_X: u32 = 1780;
 
 pub(super) fn vehicle_active(frame: &RgbImage) -> bool {
     // Mavuika's mounted HUD adds the orange T dismount/change control.
@@ -41,6 +42,7 @@ pub(super) struct MotionDetector {
     cancel: GrayImage,
     interact: GrayImage,
     ground: GrayImage,
+    skill_key: GrayImage,
 }
 impl MotionDetector {
     pub fn new() -> Result<Self> {
@@ -57,6 +59,13 @@ impl MotionDetector {
             cancel: load("Common/Element", "key_x.png")?,
             interact: load("AutoPick", "F.png")?,
             ground: load("QuickTeleport", "MapUndergroundToGroundButton.png")?,
+            // Footer keycaps use a smaller font than interaction prompts.
+            skill_key: imageops::resize(
+                &load("AutoPick", "E.png")?,
+                24,
+                24,
+                imageops::FilterType::Triangle,
+            ),
         })
     }
     pub fn ore_prompt_key(&self, frame: &RgbImage, top: u32, height: u32) -> bool {
@@ -73,6 +82,12 @@ impl MotionDetector {
             1800.0 + x as f64 + self.ground.width() as f64 / 2.0,
             250.0 + y as f64 + self.ground.height() as f64 / 2.0,
         ))
+    }
+    pub fn borrowed_skill_present(&self, frame: &RgbImage) -> bool {
+        let area = imageops::grayscale(
+            &imageops::crop_imm(frame, UNDERWATER_SKILL_X, 1018, 74, 40).to_image(),
+        );
+        match_glyph(&area, &self.skill_key) >= 0.84
     }
     pub fn observe(&self, frame: &RgbImage, labels: &str) -> Motion {
         let area = imageops::grayscale(&imageops::crop_imm(frame, 1570, 1010, 200, 70).to_image());
@@ -132,14 +147,15 @@ pub(super) fn crab_reference_matches(frame: &RgbImage) -> Result<bool> {
         return Ok(false);
     }
     let template = image::open(path)?.to_luma8();
-    let skill = imageops::grayscale(&imageops::crop_imm(frame, 1680, 938, 74, 70).to_image());
+    let skill =
+        imageops::grayscale(&imageops::crop_imm(frame, UNDERWATER_SKILL_X, 938, 74, 84).to_image());
     Ok(match_glyph(&skill, &template) >= 0.84)
 }
 
 pub(super) fn save_crab_reference(frame: &RgbImage) -> Result<()> {
     // Use the icon's interior so the cooldown digits and keyboard label cannot
     // become the learned feature. Calibration is an explicit local operation.
-    let icon = imageops::crop_imm(frame, 1691, 947, 48, 36).to_image();
+    let icon = imageops::crop_imm(frame, UNDERWATER_SKILL_X + 10, 955, 58, 58).to_image();
     let mut bytes = std::io::Cursor::new(Vec::new());
     icon.write_to(&mut bytes, image::ImageFormat::Png)?;
     write_cache(
@@ -185,6 +201,19 @@ mod tests {
         assert!(
             (p.0 - 1844.0).abs() < 5.0 && (p.1 - 442.0).abs() < 5.0,
             "{p:?}"
+        );
+    }
+    #[test]
+    #[ignore = "requires a local underwater frame"]
+    fn verify_local_borrowed_skill_key() {
+        let frame = image::open(std::env::var("GGSCANNER_MOTION_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(
+            MotionDetector::new()
+                .unwrap()
+                .borrowed_skill_present(&frame),
+            std::env::var("GGSCANNER_EXPECT_SKILL").unwrap() == "true"
         );
     }
     #[test]

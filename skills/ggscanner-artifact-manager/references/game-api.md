@@ -32,6 +32,7 @@ Skill 后可读 [在线规范](https://github.com/righttang/GGScanner/blob/main/
 - `issues` 为空只表示指令已适配。查看 `lastRun` 区分走完且有收获提示、走完但收获未确认、失败和停止；路线或引擎版本变化后旧记录失效。
 - 通用采矿 `strategy` 可用 `auto`、`linnea`、`zhongli`、`claymore`；auto 的通用碎矿使用玛薇卡普通大剑攻击。固定队伍为玛薇卡、迪希雅、莉奈娅、钟离，路线写明角色时仍按路线执行。
 - 水下先跑对应 A00 学习技能路线。观察确认已借到重甲蟹技能后，用 `{"routeIds":[],"stationary":true,"calibrateCrab":true}` 保存本机图标参照，再运行采矿路线。参照只用于识别，不能授予技能；错误技能会停止，不在水下轮转地面护盾。
+- 水下原地试采用 `{"routeIds":[],"stationary":true,"strategy":"auto"}`；自动模式使用已校验的螃蟹技能，其他原地策略在水下会被拒绝。
 - 重叠地层不明确时停止；本地路线可用 `info.floor` 指定楼层。旧日之海、远古圣山、龙附身和额外角色脚本仍列出限制，不宣称所有社区路线都能完成。
 - 202 后轮询 `/status`，用当前 jobId 查询 `/result` 或 `/stop`。网络超时先查状态，
   不自动重发开始请求。右键也可停止；焦点丢失会结束任务。

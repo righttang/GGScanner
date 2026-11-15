@@ -24,6 +24,8 @@ inside the application. Route execution does not require GGArtifact or BetterGI.
   deposit. `strategy` accepts `auto`, `linnea`, `zhongli`, `claymore`. Auto uses
   Mavuika's ordinary claymore attacks for generic `mining` points; explicitly
   named scripts and `linnea_mining` preserve their required role.
+  Stationary `auto` uses Linnea on land and the verified borrowed crab skill
+  underwater. Other stationary strategies reject an underwater HUD.
 
 The fixed role set is Linnea, Zhongli, Mavuika and Dehya. Bring the roles required
 by the selected routes; the runtime reads their existing party slots. It does
