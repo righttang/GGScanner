@@ -103,6 +103,23 @@ pub(super) fn enemy_health_bar(frame: &RgbImage) -> bool {
 }
 
 /// Horizontal bands of bright UI glyphs, with padding for a single-line OCR model.
+/// Region tiles move down when the map gains additional header messages.
+/// Overlapping line crops cover both white text and the selected dark label.
+pub(super) fn map_region_button(
+    region: &str,
+    mut read: impl FnMut(u32, u32, u32, u32) -> Result<String>,
+) -> Result<Option<(f64, f64)>> {
+    for y in (140..960).step_by(20) {
+        for x in [1320, 1620] {
+            let label = read(x, y, 260, 48)?;
+            if label.split_whitespace().collect::<String>() == region {
+                return Ok(Some((x as f64 + 100.0, y as f64 + 24.0)));
+            }
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn text_rows(
     frame: &RgbImage,
     x: u32,
@@ -652,6 +669,28 @@ pub(super) fn estimate_camera_rotation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires a local map region menu with additional header messages"]
+    fn read_shifted_local_map_regions() {
+        use yas::ocr::ImageToText;
+        let frame = image::open(std::env::var("GGSCANNER_REGION_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let ocr = crate::scanner::common::ocr_factory::create_ocr_model("ppocrv4").unwrap();
+        for (region, expected) in [
+            ("枫丹", (1420.0, 425.0)),
+            ("挪德卡莱", (1420.0, 527.0)),
+            ("至冬", (1720.0, 527.0)),
+        ] {
+            let actual = map_region_button(region, |x, y, w, h| {
+                ocr.image_to_text(&imageops::crop_imm(&frame, x, y, w, h).to_image(), false)
+            })
+            .unwrap()
+            .unwrap_or_else(|| panic!("Missing region {region}"));
+            assert!((actual.0 - expected.0).abs() < 2.0);
+            assert!((actual.1 - expected.1).abs() < 40.0, "{region}: {actual:?}");
+        }
+    }
     #[test]
     #[ignore = "requires local enemy HP and Mavuika ring regression frames"]
     fn distinguish_local_enemy_bar_from_pyro_ring() {

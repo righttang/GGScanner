@@ -29,6 +29,7 @@ Skill 后可读 [在线规范](https://github.com/righttang/GGScanner/blob/main/
 - 只选已下载且 `issues` 为空的路线。先在矿点用
   `POST /mining/start` 的 `{"routeIds":[],"stationary":true}` 试采；路线任务用
   `{"routeIds":["已检查的ID"]}`，按请求顺序各运行一次。
+- 开始前确认处于游戏主界面；任务失败后先检查并关闭残留菜单，再开始下一项。
 - `issues` 为空只表示指令已适配。查看 `lastRun` 区分走完且有收获提示、走完但收获未确认、失败和停止；路线或引擎版本变化后旧记录失效。
 - 通用采矿 `strategy` 可用 `auto`、`linnea`、`zhongli`、`claymore`；auto 的通用碎矿使用玛薇卡普通大剑攻击。固定队伍为玛薇卡、迪希雅、莉奈娅、钟离，路线写明角色时仍按路线执行。
 - 水下先跑对应 A00 学习技能路线。观察确认已借到重甲蟹技能后，用 `{"routeIds":[],"stationary":true,"calibrateCrab":true}` 保存本机图标参照，再运行采矿路线。参照只用于识别，不能授予技能；错误技能会停止，不在水下轮转地面护盾。

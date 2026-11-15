@@ -37,8 +37,11 @@ A shot, skill cast or completed walk without acquisition is `unconfirmed`.
 Navigation supports walk/run/dash/jump, climbing, glider takeoff, `stop_flying`
 (plunge and landing HUD checks), and underwater horizontal movement with typed
 vertical key scripts. It confirms HUD transitions and fails bounded attempts.
-The big map requires agreeing SIFT features and a north-up geometric transform;
-mini-map tracking uses local terrain templates. Layer manifests include caves;
+The big map requires agreeing SIFT features and a north-up geometric transform.
+Region labels are located across overlapping rows to accommodate extra menu
+header messages. Start a route from the world view; after a failed task, inspect
+and close any remaining menus before retrying.
+Mini-map tracking uses local terrain templates. Layer manifests include caves;
 optional `info.floor` disambiguates overlapping floors. An ambiguous floor
 stops the route. `mapFloor` reports the most recently confirmed floor.
 

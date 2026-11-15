@@ -1077,22 +1077,12 @@ mod windows {
             game.click(1770.0, 1010.0)?;
             game.wait(500)?;
             let frame = game.frame()?;
-            let mut selected = false;
-            for y in [158, 262, 364, 466, 586, 690, 792, 914] {
-                for x in [1320, 1620] {
-                    let name = game.read(&frame, x, y, 260, 45)?;
-                    if name.contains(region) {
-                        game.click(x as f64 + 100.0, y as f64 + 25.0)?;
-                        game.wait(700)?;
-                        selected = true;
-                        break;
-                    }
-                }
-                if selected {
-                    break;
-                }
-            }
-            ensure!(selected, "Map region {region} could not be selected");
+            let (x, y) = super::super::vision::map_region_button(region, |x, y, w, h| {
+                game.read(&frame, x, y, w, h)
+            })?
+            .with_context(|| format!("Map region {region} could not be selected"))?;
+            game.click(x, y)?;
+            game.wait(700)?;
         }
         if let Some((x, y)) = game.motion.ground_button(&game.frame()?) {
             game.click(x, y)?;
