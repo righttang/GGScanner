@@ -168,7 +168,7 @@ Windows elevation is not disabled.
 Keyboard requests omit mouse coordinates. `holdMs` defaults to 0 (tap) and accepts
 0–3000 milliseconds. The key is released before the `delayMs` wait and optional
 OCR. Holding is Windows-only; other platforms reject held requests before input.
-Each request uses one key, not a combination or persistent key-down state.
+Each request uses one fixed action, with no persistent key-down state.
 
 | Action | Accepted names |
 | --- | --- |
@@ -177,10 +177,21 @@ Each request uses one key, not a combination or persistent key-down state.
 | Skill / burst | `skill`/`e`, `burst`/`q` |
 | Party slots | `party1`–`party4` or `1`–`4` |
 | Navigation | `menu`/`esc`/`escape`, `partySetup`/`l`, `inventory`/`b`, `character`/`c`, `map`/`m`, `interact`/`f`, `confirm`/`enter`/`return` |
+| Windows display recovery | `fullscreen` (fixed Alt+Enter toggle) |
 
 Letter aliases also accept uppercase. Arbitrary system shortcuts are rejected.
 Mouse coordinates, `text` and unknown fields are rejected by this route. OCR,
 origin checks, admission and receipt rules are the same as `/input/click`.
+
+`fullscreen` recovers a recognized local Windows game window even when its
+current aspect ratio prevents normal scanner initialization. It accepts only
+`holdMs:0` and an empty `ocr` array, verifies foreground focus and cancellation,
+and releases both keys on completion, errors or unwinding. Feedback includes the
+new client size. Normal input and scanning still require 16:9. The action is a
+toggle: poll the original receipt and inspect the resulting size before any
+further input; never repeat an unknown result blindly. Cloud game windows and
+other platforms are unsupported. Use the game's graphics settings afterwards
+if a particular resolution is needed.
 
 The initial response is HTTP 202. Poll `/input/result?jobId=walk-step-001` for the
 final feedback; `/health`, `/status` and `/stop` remain responsive while holding.

@@ -41,4 +41,10 @@ impl GameInfoBuilder {
         #[cfg(not(any(windows, target_os = "linux")))]
         crate::game_info::os::get_game_info()
     }
+
+    #[cfg(target_os = "windows")]
+    pub fn build_for_window_recovery(&self) -> Result<GameInfo> {
+        let names: Vec<_> = self.local_window_names.iter().map(String::as_str).collect();
+        crate::game_info::os::get_game_info_for_window_recovery(&names)
+    }
 }

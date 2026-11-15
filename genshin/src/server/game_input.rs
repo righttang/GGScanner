@@ -40,6 +40,8 @@ pub struct ClickRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GameKey {
+    /// Windows-only, fixed Alt+Enter chord for recovering the game's display.
+    Fullscreen,
     #[serde(alias = "esc", alias = "escape")]
     Menu,
     #[serde(alias = "l", alias = "L")]
@@ -81,8 +83,11 @@ pub enum GameKey {
 }
 
 impl GameKey {
-    fn input_key(self) -> enigo::Key {
-        match self {
+    fn input_key(self) -> Result<enigo::Key> {
+        Ok(match self {
+            Self::Fullscreen => {
+                anyhow::bail!("Fullscreen requires the guarded display-recovery path")
+            },
             Self::Menu => enigo::Key::Escape,
             Self::PartySetup => enigo::Key::Layout('l'),
             Self::Inventory => enigo::Key::Layout('b'),
@@ -102,7 +107,7 @@ impl GameKey {
             Self::Party2 => enigo::Key::Layout('2'),
             Self::Party3 => enigo::Key::Layout('3'),
             Self::Party4 => enigo::Key::Layout('4'),
-        }
+        })
     }
 }
 
@@ -142,6 +147,10 @@ fn default_delay() -> u64 {
 
 impl ClickRequest {
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.key != Some(GameKey::Fullscreen) || (self.hold_ms == 0 && self.ocr.is_empty()),
+            "Fullscreen recovery does not accept holdMs or OCR"
+        );
         anyhow::ensure!(self.hold_ms <= 3_000, "holdMs must be between 0 and 3000");
         anyhow::ensure!(
             self.hold_ms == 0 || self.key.is_some(),
@@ -527,14 +536,14 @@ pub(super) fn execute_game_click(
         feedback.clicked = None;
         if let Some(key) = request.key {
             if request.hold_ms == 0 {
-                exec.ctrl.system_control.key_press(key.input_key())?;
+                exec.ctrl.system_control.key_press(key.input_key()?)?;
             } else {
                 #[cfg(target_os = "windows")]
                 {
                     let window = exec.ctrl.game_info.native_window();
                     yas::system_control::key_hold::with_held_key(
                         &mut exec.ctrl.system_control,
-                        key.input_key(),
+                        key.input_key()?,
                         || {
                             let deadline =
                                 std::time::Instant::now() + Duration::from_millis(request.hold_ms);
@@ -616,6 +625,71 @@ pub(super) fn execute_game_click(
     feedback
 }
 
+fn execute_display_recovery(
+    request: &ClickRequest,
+    token: yas::cancel::CancelToken,
+) -> ClickFeedback {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (request, token);
+        ClickFeedback::failed("Fullscreen recovery is supported on Windows only")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut feedback = ClickFeedback::failed("Display recovery was not executed");
+        let result = (|| -> Result<()> {
+            let info = crate::cli::GoodScannerApplication::game_info_builder()
+                .build_for_window_recovery()?;
+            let window = info.native_window();
+            request.validate_window(
+                info.window.width.max(0) as u32,
+                info.window.height.max(0) as u32,
+            )?;
+            window.request_focus(false)?;
+            let checked_wait = |milliseconds: u64| -> Result<()> {
+                let deadline = std::time::Instant::now() + Duration::from_millis(milliseconds);
+                loop {
+                    anyhow::ensure!(!token.check_rmb(), "Display recovery cancelled");
+                    anyhow::ensure!(
+                        window.is_foreground(),
+                        "Game focus lost during display recovery"
+                    );
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(20)));
+                }
+                Ok(())
+            };
+            checked_wait(80)?;
+            let mut control = yas::system_control::prepared_control()?;
+            feedback.clicked = None;
+            yas::system_control::key_hold::with_held_key_control(
+                &mut control,
+                enigo::Key::Alt,
+                |control| {
+                    checked_wait(80)?;
+                    yas::system_control::key_hold::with_held_key(
+                        control,
+                        enigo::Key::Return,
+                        || checked_wait(100),
+                    )
+                },
+            )?;
+            feedback.clicked = Some(true);
+            std::thread::sleep(Duration::from_millis(request.delay_ms));
+            let updated = crate::cli::GoodScannerApplication::game_info_builder()
+                .build_for_window_recovery()?;
+            feedback.width = updated.window.width.max(0) as u32;
+            feedback.height = updated.window.height.max(0) as u32;
+            Ok(())
+        })();
+        feedback.error = result.err().map(|error| format!("{error:#}"));
+        feedback
+    }
+}
+
 pub(super) fn execute_task<F>(
     task: &InputTask,
     executor: &mut Option<Box<dyn ManageExecutor>>,
@@ -627,6 +701,11 @@ where
 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         anyhow::ensure!(!token.is_cancelled(), "Input cancelled before execution");
+        task.request.validate()?;
+        if task.request.key == Some(GameKey::Fullscreen) {
+            *executor = None;
+            return Ok(execute_display_recovery(&task.request, token));
+        }
         if executor.is_none() {
             *executor = Some(init()?);
         }
@@ -897,6 +976,26 @@ mod tests {
                 .0,
             403
         );
+    }
+
+    #[test]
+    fn fullscreen_recovery_is_a_fixed_chord_without_holds_or_ocr() {
+        let parse = |value| {
+            serde_json::from_value::<KeyRequest>(value)
+                .map(ClickRequest::from)
+                .unwrap()
+        };
+        assert!(parse(serde_json::json!({"key":"fullscreen"}))
+            .validate()
+            .is_ok());
+        assert!(parse(serde_json::json!({"key":"fullscreen","holdMs":1}))
+            .validate()
+            .is_err());
+        assert!(parse(
+            serde_json::json!({"key":"fullscreen","ocr":[{"x":0,"y":0,"width":1,"height":1}]})
+        )
+        .validate()
+        .is_err());
     }
 
     #[test]

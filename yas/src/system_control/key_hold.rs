@@ -12,6 +12,15 @@ pub fn with_held_key(
     key: Key,
     run: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    with_held_key_control(driver, key, |_| run())
+}
+
+/// Also permits nested keys while retaining modifier release on every exit.
+pub fn with_held_key_control<D: KeyDriver>(
+    driver: &mut D,
+    key: Key,
+    run: impl FnOnce(&mut D) -> Result<()>,
+) -> Result<()> {
     struct Release<'a, D: KeyDriver> {
         driver: &'a mut D,
         key: Key,
@@ -30,7 +39,7 @@ pub fn with_held_key(
         released: false,
     };
     guard.driver.key_down(key)?;
-    let result = run();
+    let result = run(guard.driver);
     let release = guard.driver.key_up(key);
     guard.released = release.is_ok();
     result.and(release)
@@ -84,5 +93,24 @@ mod tests {
         .is_err());
         assert!(!driver.held);
         assert_eq!(driver.releases, 1);
+    }
+    #[test]
+    fn nested_chord_releases_both_keys_on_error_and_panic() {
+        for panic in [false, true] {
+            let mut driver = Driver::default();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_held_key_control(&mut driver, Key::Alt, |control| {
+                    with_held_key(control, Key::Return, || {
+                        if panic {
+                            panic!("input failed");
+                        }
+                        anyhow::bail!("focus lost");
+                    })
+                })
+            }));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert!(!driver.held);
+            assert_eq!(driver.releases, 2);
+        }
     }
 }

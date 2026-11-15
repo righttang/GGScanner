@@ -1582,11 +1582,16 @@ impl GoodScannerApplication {
     }
 
     pub fn get_game_info() -> Result<GameInfo> {
-        GameInfoBuilder::new()
-            .add_local_window_name("\u{539F}\u{795E}") // 原神
+        Self::game_info_builder().build()
+    }
+
+    pub(crate) fn game_info_builder() -> GameInfoBuilder {
+        let mut builder = GameInfoBuilder::new();
+        builder
+            .add_local_window_name("\u{539F}\u{795E}")
             .add_local_window_name("Genshin Impact")
-            .add_cloud_window_name("\u{4E91}\u{00B7}\u{539F}\u{795E}") // 云·原神
-            .build()
+            .add_cloud_window_name("\u{4E91}\u{00B7}\u{539F}\u{795E}");
+        builder
     }
 
     /// Build a character scanner config from global CLI flags + JSON config.

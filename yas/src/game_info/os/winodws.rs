@@ -124,22 +124,8 @@ fn get_window(window_names: &[&str]) -> Result<(HWND, bool)> {
 }
 
 pub fn get_game_info(window_names: &[&str]) -> Result<GameInfo> {
-    utils::set_dpi_awareness();
-
-    let (hwnd, is_cloud) = get_window(window_names)?;
-
-    // Only restore if minimized — do NOT steal focus here.
-    // Focus is handled later by GenshinGameController::focus_game_window()
-    // after the user confirms they are ready.
-    unsafe {
-        if IsIconic(hwnd) != 0 {
-            ShowWindow(hwnd, SW_RESTORE);
-            utils::sleep(500);
-        }
-    }
-
-    let rect = utils::get_client_rect(hwnd)?;
-
+    let info = get_window_info(window_names)?;
+    let rect = info.window;
     if !is_16x9(rect.to_rect_usize().size()) {
         log_error!(
             "游戏窗口内部区域为 {}x{}，不是16:9比例。本工具仅支持16:9分辨率（如1920×1080、2560×1440、3840×2160）。\n\
@@ -155,6 +141,38 @@ pub fn get_game_info(window_names: &[&str]) -> Result<GameInfo> {
             rect.width, rect.height, rect.width, rect.height
         ));
     }
+    Ok(info)
+}
+
+/// Window recovery must remain possible when the scanner's aspect check fails.
+/// Only known local game classes qualify for keyboard display recovery.
+pub fn get_game_info_for_window_recovery(window_names: &[&str]) -> Result<GameInfo> {
+    let info = get_window_info(window_names)?;
+    anyhow::ensure!(
+        !info.is_cloud
+            && get_window_class(info.hwnd as HWND)
+                .is_some_and(|class| GAME_WINDOW_CLASSES.iter().any(|known| class == *known)),
+        "Display recovery requires a recognized local game window"
+    );
+    Ok(info)
+}
+
+fn get_window_info(window_names: &[&str]) -> Result<GameInfo> {
+    utils::set_dpi_awareness();
+
+    let (hwnd, is_cloud) = get_window(window_names)?;
+
+    // Only restore if minimized — do NOT steal focus here.
+    // Focus is handled later by GenshinGameController::focus_game_window()
+    // after the user confirms they are ready.
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+            utils::sleep(500);
+        }
+    }
+
+    let rect = utils::get_client_rect(hwnd)?;
 
     Ok(GameInfo {
         window: rect,
