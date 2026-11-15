@@ -48,6 +48,7 @@ tiny_http = "0.12"
 uuid = { version = "1", features = ["v4"] }
 ort = { version = "=2.0.0-rc.10", features = ["load-dynamic"] }
 ndarray = "0.16"
+sift-features = "=0.1.0"
 
 # capture-only dependencies
 auto-artifactarium = { git = "https://github.com/konkers/auto-artifactarium", rev = "4ba25fac64b88970143af6bc2a2ef51338e620d0", optional = true }

@@ -173,6 +173,7 @@ mod tests {
         let request = || MiningRequest {
             route_ids: vec![],
             stationary: true,
+            ..Default::default()
         };
         let id = client.submit_mining(request()).unwrap();
         let (queued, job) = rx.recv().unwrap();

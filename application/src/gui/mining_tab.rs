@@ -2,6 +2,7 @@ use super::state::Lang;
 use eframe::egui;
 use genshin_scanner::{
     manager::models::{JobPhase, JobState},
+    mining::runtime::MiningStrategy,
     mining::RouteEntry,
 };
 use std::{
@@ -21,6 +22,8 @@ pub struct MiningUi {
     category: String,
     region: String,
     search: String,
+    strategy: MiningStrategy,
+    last_validation_job: Option<String>,
 }
 
 impl Default for MiningUi {
@@ -40,6 +43,8 @@ impl Default for MiningUi {
             category: String::new(),
             region: String::new(),
             search: String::new(),
+            strategy: MiningStrategy::Auto,
+            last_validation_job: None,
         }
     }
 }
@@ -303,6 +308,23 @@ impl MiningUi {
                             "Action checks passed; see task reports for in-game results",
                         ));
                     }
+                    if let Some(run) = &entry.last_run {
+                        let outcome = match run.outcome.as_str() {
+                            "completedWithLoot" => {
+                                l.t("已走完并看到收获提示", "Completed with loot notifications")
+                            },
+                            "completedUnconfirmed" => {
+                                l.t("已走完，收获未确认", "Completed; acquisition unconfirmed")
+                            },
+                            "stopped" => l.t("上次测试已中止", "Last run stopped"),
+                            _ => l.t("上次测试失败", "Last run failed"),
+                        };
+                        ui.small(format!(
+                            "{} · {}/{}",
+                            outcome, run.completed_points, run.total_points
+                        ))
+                        .on_hover_text(run.error.as_deref().unwrap_or(""));
+                    }
                     for issue in &entry.issues {
                         let issue = match issue.as_str() {
                             "Teyvat surface routes only" => {
@@ -332,6 +354,13 @@ impl MiningUi {
         }
         ui.separator();
         ui.label(l.t("请按路线要求携带采矿角色。按列表顺序运行，每条一次。鼠标右键或停止按钮可终止。","Bring the characters required by each route. Run once in list order. Right-click or press Stop to cancel."));
+        egui::ComboBox::from_id_salt("mining-strategy")
+            .selected_text(strategy_label(self.strategy, l))
+            .show_ui(ui, |ui| {
+                for strategy in [MiningStrategy::Auto, MiningStrategy::Linnea, MiningStrategy::Zhongli, MiningStrategy::Claymore] {
+                    ui.selectable_value(&mut self.strategy, strategy, strategy_label(strategy, l));
+                }
+            }).response.on_hover_text(l.t("用于通用采矿和原地试采；路线写明角色的动作按路线执行。", "Used for generic mining and stationary tests; explicitly named route actions keep their required character."));
         if ui
             .add_enabled(
                 !blocked && self.pending.is_none() && !self.selected.is_empty(),
@@ -348,7 +377,7 @@ impl MiningUi {
             self.request(
                 ui,
                 "/mining/start",
-                Some(serde_json::json!({"routeIds":ids})),
+                Some(serde_json::json!({"routeIds":ids,"strategy":self.strategy})),
             );
         }
         if ui
@@ -361,8 +390,12 @@ impl MiningUi {
             self.request(
                 ui,
                 "/mining/start",
-                Some(serde_json::json!({"routeIds":[],"stationary":true})),
+                Some(serde_json::json!({"routeIds":[],"stationary":true,"strategy":self.strategy})),
             );
+        }
+        if ui.add_enabled(!blocked && self.pending.is_none(),egui::Button::new(l.t("保存当前重甲蟹技能图标","Save current armored crab skill icon")))
+            .on_hover_text(l.t("先运行 A00 学习技能并确认图标，再保存以便后续自动校验。","Run A00, confirm the borrowed armored crab skill, then save its icon for subsequent checks.")).clicked() {
+            self.request(ui,"/mining/start",Some(serde_json::json!({"routeIds":[],"stationary":true,"calibrateCrab":true})));
         }
     }
     pub fn status(&mut self, ui: &mut egui::Ui, l: Lang, state: &Arc<Mutex<JobState>>) {
@@ -383,6 +416,15 @@ impl MiningUi {
             ui.label(error);
         }
         let state = state.lock().unwrap().clone();
+        if state.state != JobPhase::Running
+            && state.mining.is_some()
+            && self.last_validation_job != state.job_id
+        {
+            if let Ok(entries) = genshin_scanner::mining::RouteStore::default().list() {
+                self.entries = entries;
+            }
+            self.last_validation_job = state.job_id.clone();
+        }
         if self
             .local
             .lock()
@@ -414,6 +456,10 @@ impl MiningUi {
             "teleporting" => l.t("传送", "Teleporting"),
             "moving" => l.t("跑线", "Moving"),
             "executingAction" => l.t("执行路线动作", "Executing route action"),
+            "breakingOre" => l.t("碎矿", "Breaking ore"),
+            "pickingUp" => l.t("拾取矿物", "Collecting ore"),
+            "landing" => l.t("确认着陆", "Confirming landing"),
+            "fighting" => l.t("清理附近敌人", "Clearing nearby enemies"),
             "searchingOre" => l.t("寻找矿石", "Searching for ore"),
             "aiming" => l.t("瞄准", "Aiming"),
             "shooting" => l.t("射击并确认收获", "Shooting and checking loot"),
@@ -451,7 +497,15 @@ impl MiningUi {
                 "collected" => l.t("已确认获得", "Collection confirmed"),
                 "noOre" => l.t("未发现矿石", "No ore detected"),
                 "interrupted" => l.t("已中断", "Interrupted"),
-                _ => l.t("已射击，收获待确认", "Shot fired, loot unconfirmed"),
+                "cleared" => l.t("敌人血条已消失", "Enemy health bars cleared"),
+                "noEnemiesObserved" => l.t("未观察到敌人血条", "No enemy health bars observed"),
+                _ if point.method.is_empty() || point.method == "linnea" => {
+                    l.t("已射击，收获待确认", "Shot fired, loot unconfirmed")
+                },
+                _ => l.t(
+                    "已执行采矿，收获待确认",
+                    "Mining attempted, loot unconfirmed",
+                ),
             };
             ui.label(format!(
                 "{} · {} · {}",
@@ -485,6 +539,14 @@ fn matches_filter(entry: &RouteEntry, category: &str, region: &str, search: &str
                 .name
                 .to_lowercase()
                 .contains(&search.trim().to_lowercase()))
+}
+fn strategy_label(strategy: MiningStrategy, l: Lang) -> &'static str {
+    match strategy {
+        MiningStrategy::Auto => l.t("使用路线默认方式", "Use route defaults"),
+        MiningStrategy::Linnea => l.t("莉奈娅射矿", "Linnea aimed mining"),
+        MiningStrategy::Zhongli => l.t("钟离长按技能碎矿", "Zhongli held skill"),
+        MiningStrategy::Claymore => l.t("玛薇卡大剑采矿", "Mavuika claymore mining"),
+    }
 }
 fn category_label(category: &str, l: Lang) -> &'static str {
     match category {

@@ -51,6 +51,7 @@ pub enum GameKey {
     Interact,
     Jump,
     Descend,
+    Detach,
     Sprint,
     Slot(u8),
 }
@@ -68,6 +69,7 @@ impl GameKey {
             "F" => Ok(Self::Interact),
             "J" | "SPACE" => Ok(Self::Jump),
             "CTRL" | "CONTROL" | "LCONTROL" => Ok(Self::Descend),
+            "X" => Ok(Self::Detach),
             "SHIFT" | "LSHIFT" => Ok(Self::Sprint),
             "1" | "2" | "3" | "4" => Ok(Self::Slot(key.parse()?)),
             _ => bail!("Unsupported game key: {input}"),
@@ -85,6 +87,7 @@ impl GameKey {
             Self::Interact => enigo::Key::Layout('f'),
             Self::Jump => enigo::Key::Space,
             Self::Descend => enigo::Key::Control,
+            Self::Detach => enigo::Key::Layout('x'),
             Self::Sprint => enigo::Key::Shift,
             Self::Slot(slot) => enigo::Key::Layout(char::from(b'0' + slot)),
         }
@@ -275,12 +278,31 @@ pub fn parse_script(script: &str) -> Result<Vec<Action>> {
 /// Implemented by the production game controller, and by recording drivers in
 /// tests. Cancellation/focus checks belong in driver waits and input presses.
 pub trait ActionDriver {
+    /// Native backends can verify a skill transition after its inputs release.
+    fn after_action(&mut self, _action: &Action) -> Result<()> {
+        Ok(())
+    }
     fn select(&mut self, role: Role) -> Result<()>;
     fn wait(&mut self, milliseconds: u64) -> Result<()>;
     fn move_camera(&mut self, x: i32, y: i32) -> Result<()>;
     fn press(&mut self, key: GameKey) -> Result<()>;
     fn key_state(&mut self, key: GameKey, down: bool) -> Result<()>;
     fn button_state(&mut self, button: Button, down: bool) -> Result<()>;
+}
+
+pub fn mining_role(actions: &[Action]) -> Option<Role> {
+    let mut role = None;
+    for action in actions {
+        match action {
+            Action::Select { role: selected } => role = Some(*selected),
+            Action::Hold {
+                key: GameKey::Skill,
+                ..
+            } if role == Some(Role::Zhongli) => return role,
+            _ => {},
+        }
+    }
+    None
 }
 
 struct HeldInputs<'a, D: ActionDriver> {
@@ -350,6 +372,7 @@ pub fn execute_script(driver: &mut impl ActionDriver, script: &str) -> Result<()
     };
     let result = (|| {
         for action in actions {
+            let observed_action = action.clone();
             match action {
                 Action::Select { role } => held.driver.select(role)?,
                 Action::Wait { milliseconds } => held.driver.wait(milliseconds)?,
@@ -382,6 +405,7 @@ pub fn execute_script(driver: &mut impl ActionDriver, script: &str) -> Result<()
                     }
                 },
             }
+            held.driver.after_action(&observed_action)?;
         }
         Ok(())
     })();

@@ -3,17 +3,35 @@ use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use yas::cancel::CancelToken;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MiningStrategy {
+    #[default]
+    Auto,
+    Linnea,
+    Zhongli,
+    Claymore,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MiningRequest {
     pub route_ids: Vec<String>,
     /// A single stationary scan is useful for calibrating a new display.
     #[serde(default)]
     pub stationary: bool,
+    #[serde(default)]
+    pub strategy: MiningStrategy,
+    #[serde(default)]
+    pub calibrate_crab: bool,
 }
 
 impl MiningRequest {
     pub fn routes(&self) -> Result<Vec<Route>> {
+        ensure!(
+            !self.calibrate_crab || self.stationary,
+            "Crab calibration requires stationary mode"
+        );
         ensure!(
             self.route_ids
                 .iter()
@@ -59,6 +77,8 @@ pub struct MiningReport {
     pub loot: std::collections::BTreeMap<String, usize>,
     pub error: Option<String>,
     pub stopped: bool,
+    #[serde(default)]
+    pub map_floor: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +88,8 @@ pub struct MiningPointResult {
     pub waypoint: usize,
     pub outcome: String,
     pub shots: usize,
+    #[serde(default)]
+    pub method: String,
 }
 
 pub type MiningProgress<'a> = dyn Fn(&MiningReport) + 'a;
@@ -130,6 +152,7 @@ pub fn execute(
 #[cfg(windows)]
 mod windows {
     use super::super::actions::{self, ActionDriver, Button, GameKey, Role};
+    use super::super::motion::{Motion, MotionDetector};
     use super::super::navigation::{TeleportAnchor, TeleportCatalog};
     use super::super::vision::{Atlas, MiniMapLocator, OreDetector};
     use super::*;
@@ -152,6 +175,12 @@ mod windows {
         aiming: bool,
         selected_role: Option<Role>,
         script_deadline: Option<Instant>,
+        loot_tracker: super::super::loot::LootTracker,
+        started: Instant,
+        skill_ready: std::collections::BTreeMap<Role, Instant>,
+        motion: MotionDetector,
+        vehicle: bool,
+        underwater_route: bool,
     }
     impl Drop for Game<'_> {
         fn drop(&mut self) {
@@ -160,6 +189,14 @@ mod windows {
             let _ = self.ctrl.system_control.left_button(false);
             let _ = self.ctrl.system_control.middle_button(false);
             self.leave_aim();
+            if self.ctrl.game_info.native_window().is_foreground() {
+                if let Ok(frame) = self.ctrl.capture_game() {
+                    let frame = imageops::resize(&frame, 1920, 1080, FilterType::Triangle);
+                    if super::super::motion::vehicle_active(&frame) {
+                        let _ = self.ctrl.system_control.key_press(Key::Layout('e'));
+                    }
+                }
+            }
         }
     }
     impl Game<'_> {
@@ -226,6 +263,11 @@ mod windows {
         fn read(&self, frame: &RgbImage, x: u32, y: u32, w: u32, h: u32) -> Result<String> {
             self.ocr
                 .image_to_text(&imageops::crop_imm(frame, x, y, w, h).to_image(), false)
+        }
+        fn motion(&self) -> Result<Motion> {
+            let frame = self.frame()?;
+            let labels = self.read(&frame, 1510, 1008, 350, 60)?;
+            Ok(self.motion.observe(&frame, &labels))
         }
         fn click(&mut self, x: f64, y: f64) -> Result<()> {
             self.check()?;
@@ -296,9 +338,91 @@ mod windows {
                 role.name()
             )
         }
+        fn record_loot(&mut self, frame: &RgbImage, report: &mut MiningReport) -> Result<bool> {
+            let mut visible = std::collections::BTreeMap::new();
+            for (top, height) in super::super::vision::text_rows(frame, 140, 370, 360, 340) {
+                let text = self.read(frame, 140, top, 360, height)?;
+                if let Some((name, count)) = super::super::loot::parse_line(&text) {
+                    *visible.entry(name.to_string()).or_default() += count;
+                }
+            }
+            let gain = self
+                .loot_tracker
+                .observe(self.started.elapsed().as_millis() as u64, visible);
+            let changed = !gain.is_empty();
+            for (name, count) in gain {
+                *report.loot.entry(name).or_default() += count;
+            }
+            Ok(changed)
+        }
+        fn wait_skill(&mut self, role: Role) -> Result<()> {
+            if let Some(&ready) = self.skill_ready.get(&role) {
+                let remaining = ready.saturating_duration_since(Instant::now()).as_millis() as u64;
+                if remaining > 0 {
+                    self.wait(remaining)?;
+                }
+            } else {
+                let frame = self.frame()?;
+                let text = self.read(&frame, 1680, 938, 74, 70)?;
+                let digits: String = text
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if let Ok(seconds) = digits.parse::<f64>() {
+                    if seconds.is_finite() && (0.0..=20.0).contains(&seconds) {
+                        self.wait((seconds * 1000.0) as u64 + 200)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn check_underwater_skill(&mut self) -> Result<()> {
+            if self.underwater_route {
+                ensure!(
+                    self.motion()? == Motion::Underwater,
+                    "Underwater skill requires a confirmed underwater HUD"
+                );
+                self.wait_skill(Role::Dehya)?;
+                ensure!(super::super::motion::crab_reference_matches(&self.frame()?)?,"Armored crab skill is unconfirmed; run the A00 acquisition route and calibrate its visible skill icon first");
+            }
+            Ok(())
+        }
     }
 
     impl ActionDriver for Game<'_> {
+        fn after_action(&mut self, action: &actions::Action) -> Result<()> {
+            if matches!(
+                action,
+                actions::Action::Hold {
+                    key: GameKey::Skill,
+                    ..
+                }
+            ) && self.selected_role == Some(Role::Mavuika)
+            {
+                self.wait(500)?;
+                ensure!(
+                    super::super::motion::vehicle_active(&self.frame()?),
+                    "Mavuika vehicle HUD could not be confirmed"
+                );
+                self.vehicle = true;
+            }
+            if self.vehicle
+                && matches!(
+                    action,
+                    actions::Action::Press {
+                        key: GameKey::Skill
+                    }
+                )
+            {
+                self.wait(350)?;
+                ensure!(
+                    !super::super::motion::vehicle_active(&self.frame()?),
+                    "Mavuika vehicle exit could not be confirmed"
+                );
+                self.vehicle = false;
+            }
+            Ok(())
+        }
         fn select(&mut self, role: Role) -> Result<()> {
             self.select_role(role)
         }
@@ -309,12 +433,26 @@ mod windows {
             self.rotate(x as f64, y as f64)
         }
         fn press(&mut self, key: GameKey) -> Result<()> {
+            if key == GameKey::Skill {
+                self.check_underwater_skill()?;
+            }
             if matches!(key, GameKey::Slot(_)) {
                 self.selected_role = None;
             }
             self.key(key.native())
         }
         fn key_state(&mut self, key: GameKey, down: bool) -> Result<()> {
+            if key == GameKey::Skill && down {
+                self.check_underwater_skill()?;
+            }
+            if key == GameKey::Skill && self.selected_role == Some(Role::Zhongli) {
+                if down {
+                    self.wait_skill(Role::Zhongli)?;
+                } else {
+                    self.skill_ready
+                        .insert(Role::Zhongli, Instant::now() + Duration::from_secs(12));
+                }
+            }
             if down {
                 self.check()?;
                 self.ctrl.system_control.key_down(key.native())
@@ -378,12 +516,32 @@ mod windows {
             aiming: false,
             selected_role: None,
             script_deadline: None,
+            loot_tracker: Default::default(),
+            started: Instant::now(),
+            skill_ready: Default::default(),
+            motion: MotionDetector::new()?,
+            vehicle: false,
+            underwater_route: false,
         };
         game.check()?;
         if !game.ctrl.return_to_main_ui(3) {
             anyhow::bail!("Could not return to the main world");
         }
-        if request.stationary
+        if request.calibrate_crab {
+            ensure!(
+                game.motion()? == Motion::Underwater,
+                "Crab skill calibration requires an underwater HUD"
+            );
+            super::super::motion::save_crab_reference(&game.frame()?)?;
+            report.route = "crabCalibration".into();
+            report.completed_points = 1;
+            return Ok(());
+        }
+        if (request.stationary
+            && matches!(
+                request.strategy,
+                MiningStrategy::Auto | MiningStrategy::Linnea
+            ))
             || routes.iter().any(|route| {
                 route
                     .positions
@@ -396,7 +554,12 @@ mod windows {
         if request.stationary {
             report.route = "stationary".into();
             report.waypoint = 1;
-            mine(&mut game, &mut detector, 1, 24, progress, report)?;
+            match request.strategy {
+                MiningStrategy::Auto | MiningStrategy::Linnea => {
+                    mine(&mut game, &mut detector, 1, 24, progress, report)?
+                },
+                method => ground_mine(&mut game, &mut detector, method, true, progress, report)?,
+            }
             report.completed_points = 1;
             return Ok(());
         }
@@ -404,63 +567,189 @@ mod windows {
         let mini_locator = mini_locator.as_mut().unwrap();
         let teleports = TeleportCatalog::new()?;
         let mut position = None;
-        for route in routes {
+        for (route, route_id) in routes.into_iter().zip(&request.route_ids) {
             report.route = route.info.name.clone();
-            for (index, point) in route.positions.iter().enumerate() {
-                game.check()?;
-                report.waypoint = index + 1;
-                report.phase = if point.kind == "teleport" {
-                    "teleporting"
+            mini_locator.set_floor(
+                route
+                    .info
+                    .floor
+                    .or_else(|| (route.environment() == "ground").then_some(0)),
+            );
+            let completed_before = report.completed_points;
+            let loot_before = report.loot.clone();
+            let result = (|| -> Result<()> {
+                game.underwater_route = route.environment() == "underwater";
+                if game.underwater_route {
+                    game.select_role(Role::Dehya)?;
+                }
+                for (index, point) in route.positions.iter().enumerate() {
+                    game.check()?;
+                    report.waypoint = index + 1;
+                    if point.kind != "teleport"
+                        && point.action != "fight"
+                        && !game.underwater_route
+                        && super::super::vision::enemy_health_bar(&game.frame()?)
+                    {
+                        fight(&mut game, progress, report)?;
+                        position = Some(
+                            locate(&game, mini_locator, position, 60)
+                                .or_else(|_| locate(&game, mini_locator, position, 250))?,
+                        );
+                    }
+                    report.phase = if point.kind == "teleport" {
+                        "teleporting"
+                    } else {
+                        "moving"
+                    }
+                    .into();
+                    progress(report);
+                    if point.kind == "teleport" || point.action == "force_tp" {
+                        teleport(
+                            &mut game,
+                            &atlas,
+                            mini_locator,
+                            (point.x, point.y),
+                            teleports.nearest((point.x, point.y))?,
+                        )?;
+                        position = Some(locate(&game, mini_locator, Some((point.x, point.y)), 50)?);
+                        report.map_floor = mini_locator.last_floor;
+                        let landed = position.unwrap();
+                        ensure!(
+                            (landed.0 - point.x).hypot(landed.1 - point.y) <= 40.0,
+                            "Teleport landing does not match the requested anchor"
+                        );
+                    } else if point.kind == "orientation" {
+                        let current = locate(&game, mini_locator, position, 40)?;
+                        face(&mut game, current, (point.x, point.y))?;
+                    } else {
+                        position = Some(move_to(
+                            &mut game,
+                            mini_locator,
+                            position.context("Missing teleport position")?,
+                            (point.x, point.y),
+                            &point.move_mode,
+                        )?);
+                        pickup_visible(&mut game, progress, report)?;
+                    }
+                    report.map_floor = mini_locator.last_floor;
+                    match point.action.as_str() {
+                        "linnea_mining" => {
+                            let (shots, rounds) = point.shots()?;
+                            mine(&mut game, &mut detector, shots, rounds, progress, report)?;
+                        },
+                        "combat_script" => {
+                            let parsed = actions::parse_script(&point.action_params)?;
+                            let initial_loot = report.loot.values().sum::<usize>();
+                            report.phase = "executingAction".into();
+                            progress(report);
+                            game.script_deadline = Some(Instant::now() + Duration::from_secs(120));
+                            let result = actions::execute_script(&mut game, &point.action_params);
+                            game.script_deadline = None;
+                            result?;
+                            if parsed.iter().any(|a| {
+                                matches!(
+                                    a,
+                                    actions::Action::Hold {
+                                        key: GameKey::Forward
+                                            | GameKey::Back
+                                            | GameKey::Left
+                                            | GameKey::Right,
+                                        ..
+                                    } | actions::Action::Down {
+                                        key: GameKey::Forward
+                                            | GameKey::Back
+                                            | GameKey::Left
+                                            | GameKey::Right
+                                    }
+                                )
+                            }) {
+                                position=Some(locate(&game,mini_locator,position,60)
+                                    .or_else(|_|locate(&game,mini_locator,position,250))
+                                    .context("Position after route movement script could not be confirmed")?);
+                            }
+                            if game.underwater_route {
+                                pickup_visible(&mut game, progress, report)?;
+                                poll_loot(&mut game, report, progress, 800)?;
+                            }
+                            if actions::mining_role(&parsed).is_some() {
+                                finish_ground_mine(
+                                    &mut game,
+                                    "zhongli",
+                                    false,
+                                    initial_loot,
+                                    progress,
+                                    report,
+                                )?;
+                            }
+                        },
+                        "mining" => ground_mine(
+                            &mut game,
+                            &mut detector,
+                            request.strategy,
+                            point.action_params != "disablePickupAround",
+                            progress,
+                            report,
+                        )?,
+                        "pick_around" => {
+                            let rounds = point.action_params.parse::<usize>().unwrap_or(1);
+                            for _ in 0..rounds {
+                                collect_nearby(&mut game, true, progress, report)?;
+                            }
+                        },
+                        "stop_flying" => land(&mut game, &point.action_params, progress, report)?,
+                        "fight" => {
+                            fight(&mut game, progress, report)?;
+                            position = Some(
+                                locate(&game, mini_locator, position, 60)
+                                    .or_else(|_| locate(&game, mini_locator, position, 250))?,
+                            );
+                        },
+                        "force_tp" => {}, // handled by the teleport branch below
+                        "" => {},
+                        other => anyhow::bail!("Unsupported route action: {other}"),
+                    }
+                    report.completed_points += 1;
+                    progress(report);
+                }
+                Ok(())
+            })();
+            let loot = report
+                .loot
+                .iter()
+                .filter_map(|(name, n)| {
+                    let gain = n.saturating_sub(*loot_before.get(name).unwrap_or(&0));
+                    (gain > 0).then(|| (name.clone(), gain))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let validation = super::super::routes::RouteValidation {
+                engine_revision: String::new(),
+                route_fingerprint: String::new(),
+                finished_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs(),
+                outcome: if token.is_cancelled() {
+                    "stopped"
+                } else if result.is_err() {
+                    "failed"
+                } else if loot.is_empty() {
+                    "completedUnconfirmed"
                 } else {
-                    "moving"
+                    "completedWithLoot"
                 }
-                .into();
-                progress(report);
-                if point.kind == "teleport" {
-                    teleport(
-                        &mut game,
-                        &atlas,
-                        mini_locator,
-                        (point.x, point.y),
-                        teleports.nearest((point.x, point.y))?,
-                    )?;
-                    position = Some(locate(&game, mini_locator, Some((point.x, point.y)), 50)?);
-                    let landed = position.unwrap();
-                    ensure!(
-                        (landed.0 - point.x).hypot(landed.1 - point.y) <= 40.0,
-                        "Teleport landing does not match the requested anchor"
-                    );
-                } else if point.kind == "orientation" {
-                    let current = locate(&game, mini_locator, position, 40)?;
-                    face(&mut game, current, (point.x, point.y))?;
-                } else {
-                    position = Some(move_to(
-                        &mut game,
-                        mini_locator,
-                        position.context("Missing teleport position")?,
-                        (point.x, point.y),
-                        point.move_mode != "walk",
-                    )?);
-                }
-                match point.action.as_str() {
-                    "linnea_mining" => {
-                        let (shots, rounds) = point.shots()?;
-                        mine(&mut game, &mut detector, shots, rounds, progress, report)?;
-                    },
-                    "combat_script" => {
-                        report.phase = "executingAction".into();
-                        progress(report);
-                        game.script_deadline = Some(Instant::now() + Duration::from_secs(120));
-                        let result = actions::execute_script(&mut game, &point.action_params);
-                        game.script_deadline = None;
-                        result?;
-                    },
-                    "" => {},
-                    other => anyhow::bail!("Unsupported route action: {other}"),
-                }
-                report.completed_points += 1;
-                progress(report);
+                .into(),
+                completed_points: report.completed_points - completed_before,
+                total_points: route.positions.len(),
+                loot,
+                error: result.as_ref().err().map(|e| format!("{e:#}")),
+            };
+            if let Err(error) = RouteStore::default().record_run(route_id, validation) {
+                yas::log_warn!(
+                    "保存路线测试记录失败：{}",
+                    "Could not save route validation: {}",
+                    error
+                );
             }
+            result?;
         }
         Ok(())
     }
@@ -535,24 +824,58 @@ mod windows {
         mini_locator: &mut MiniMapLocator,
         mut current: (f64, f64),
         target: (f64, f64),
-        sprint: bool,
+        mode: &str,
     ) -> Result<(f64, f64)> {
         let started = Instant::now();
         let mut movement = MovementProgress::new(current);
         let mut recovery_used = false;
+        let mut last_heading: Option<f64> = None;
+        let mut since_face = 0;
+        if mode == "fly" {
+            for _ in 0..8 {
+                if game.motion()? == Motion::Gliding {
+                    break;
+                }
+                game.key(Key::Space)?;
+                game.forward(180, false)?;
+                game.wait(150)?;
+            }
+            ensure!(
+                game.motion()? == Motion::Gliding,
+                "Glider takeoff could not be confirmed"
+            );
+        }
         loop {
             let distance = (target.0 - current.0).hypot(target.1 - current.1);
-            if distance < 2.0 {
+            let motion = game.motion()?;
+            if distance < 2.0 && (mode != "climb" || motion != Motion::Climbing) {
                 return Ok(current);
             }
             ensure!(
                 started.elapsed() < Duration::from_secs(120),
                 "Waypoint timed out"
             );
-            face(game, current, target)?;
+            let heading = (current.1 - target.1).atan2(current.0 - target.0);
+            if since_face >= 6
+                || last_heading.is_none_or(|last| angle_difference(heading, last).abs() > 0.12)
+            {
+                face(game, current, target)?;
+                last_heading = Some(heading);
+                since_face = 0;
+            }
+            since_face += 1;
+            if mode == "fly" {
+                ensure!(
+                    motion == Motion::Gliding,
+                    "Gliding ended before the waypoint"
+                );
+            }
+            if mode == "jump" {
+                game.key(Key::Space)?;
+            }
             game.forward(
                 if distance < 6.0 { 150 } else { 450 },
-                sprint && distance > 20.0,
+                matches!(mode, "run" | "dash" | "swim") && distance > 20.0,
             )?;
             game.wait(100)?;
             let next = locate(game, mini_locator, Some(current), 20)
@@ -561,7 +884,13 @@ mod windows {
                 (current.0 - next.0).hypot(current.1 - next.1) < 24.0,
                 "Mini-map position jumped unexpectedly"
             );
-            if let Err(error) = movement.observe(next) {
+            // Climbing may change altitude without measurable map displacement.
+            // Its independent waypoint deadline still bounds the attempt.
+            if let Err(error) = if mode == "climb" && motion == Motion::Climbing {
+                Ok(())
+            } else {
+                movement.observe(next)
+            } {
                 if recovery_used {
                     return Err(error)
                         .with_context(|| format!("Target {target:?}; observed {next:?}"));
@@ -581,6 +910,7 @@ mod windows {
                     "Mini-map position jumped unexpectedly during recovery"
                 );
                 movement = MovementProgress::new(current);
+                last_heading = None;
                 continue;
             }
             current = next;
@@ -630,22 +960,43 @@ mod windows {
             }
             ensure!(selected, "Map region {region} could not be selected");
         }
-        // Match the map's center against the atlas at several supported zooms.
+        if let Some((x, y)) = game.motion.ground_button(&game.frame()?) {
+            game.click(x, y)?;
+            game.wait(500)?;
+        }
+        // Require several terrain features to agree on a north-up transform.
         let mut pan_trace = Vec::new();
+        let mut previous_map: Option<(f64, f64, f64)> = None;
+        let matcher =
+            super::super::features::FeatureAtlas::new(&atlas.image, map_target, Some(game.token))?;
+        let map_started = Instant::now();
         for _ in 0..40 {
+            ensure!(
+                map_started.elapsed() < Duration::from_secs(120),
+                "Map navigation exceeded 120 seconds"
+            );
             let frame = game.frame()?;
+            if cfg!(debug_assertions) {
+                frame.save("data/mining/last-map-before-match.png").ok();
+            }
             let patch = imageops::crop_imm(&frame, 660, 330, 600, 420).to_image();
-            let (x, y, scale, _) = atlas.locate(
-                &patch,
-                None,
-                10000,
-                &super::super::vision::big_map_scales(),
-                false,
-                Some(game.token),
-            )?;
+            let (x, y, scale) = matcher.locate(&patch, Some(game.token))?;
+            if let Some((px, py, ps)) = previous_map {
+                ensure!(
+                    (x - px).hypot(y - py) < 2000.0 && (scale - ps).abs() < 0.025,
+                    "Map projection changed unexpectedly after panning"
+                );
+            }
+            previous_map = Some((x, y, scale));
             let screen_x = 960.0 + (x - map_target.0) * 0.25 / scale;
             let screen_y = 540.0 + (y - map_target.1) * 0.25 / scale;
             pan_trace.push(serde_json::json!({"center":[x,y],"scale":scale,"target":map_target,"screen":[screen_x,screen_y]}));
+            if cfg!(debug_assertions) {
+                let _ = super::super::routes::write_cache(
+                    std::path::Path::new("data/mining/last-map-projection.json"),
+                    &serde_json::to_vec_pretty(&pan_trace)?,
+                );
+            }
             if (120.0..1700.0).contains(&screen_x) && (150.0..900.0).contains(&screen_y) {
                 game.click(screen_x, screen_y)?;
                 game.wait(600)?;
@@ -703,6 +1054,271 @@ mod windows {
             );
         }
         anyhow::bail!("Target anchor could not be reached on the map")
+    }
+
+    fn land(
+        game: &mut Game<'_>,
+        params: &str,
+        progress: &MiningProgress<'_>,
+        report: &mut MiningReport,
+    ) -> Result<()> {
+        report.phase = "landing".into();
+        progress(report);
+        if game.motion()? == Motion::Gliding {
+            if !params.is_empty() {
+                game.key(Key::Space)?;
+                game.wait(params.parse::<u64>()?)?;
+                game.key(Key::Space)?;
+                game.wait(300)?;
+            }
+            actions::execute_script(game, "attack")?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut grounded = None;
+        while Instant::now() < deadline {
+            game.wait(300)?;
+            let frame = game.frame()?;
+            let key = game.read(&frame, 1680, 1018, 72, 46)?;
+            if game.motion()? == Motion::Ground && key.to_ascii_uppercase().contains('E') {
+                let since = grounded.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_millis(1500) {
+                    return Ok(());
+                }
+            } else {
+                grounded = None;
+            }
+        }
+        anyhow::bail!("Landing HUD could not be confirmed within 15 seconds")
+    }
+
+    fn fight(
+        game: &mut Game<'_>,
+        progress: &MiningProgress<'_>,
+        report: &mut MiningReport,
+    ) -> Result<()> {
+        report.phase = "fighting".into();
+        progress(report);
+        let started = Instant::now();
+        let mut saw_enemy = false;
+        let mut clear_since = None;
+        let mut last_shield = None;
+        loop {
+            let enemy = super::super::vision::enemy_health_bar(&game.frame()?);
+            saw_enemy |= enemy;
+            if enemy {
+                clear_since = None;
+            } else {
+                let since = clear_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_secs(4) {
+                    let (_, sensitivity) = camera_heading(game)?;
+                    let mut found = false;
+                    for _ in 0..4 {
+                        game.rotate(90.0 * sensitivity, 0.0)?;
+                        if super::super::vision::enemy_health_bar(&game.frame()?) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found {
+                        clear_since = None;
+                        saw_enemy = true;
+                        continue;
+                    }
+                    report.points.push(MiningPointResult {
+                        route: report.route.clone(),
+                        waypoint: report.waypoint,
+                        outcome: if saw_enemy {
+                            "cleared"
+                        } else {
+                            "noEnemiesObserved"
+                        }
+                        .into(),
+                        shots: 0,
+                        method: "combat".into(),
+                    });
+                    return Ok(());
+                }
+            }
+            ensure!(
+                started.elapsed() < Duration::from_secs(90),
+                "Combat exceeded 90 seconds; enemy clearance unconfirmed"
+            );
+            if enemy {
+                if game.underwater_route {
+                    game.press(GameKey::Skill)?;
+                    game.wait(500)?;
+                    continue;
+                }
+                if last_shield.is_none_or(|time: Instant| time.elapsed() >= Duration::from_secs(13))
+                {
+                    actions::execute_script(game, "钟离 e(hold)")?;
+                    last_shield = Some(Instant::now());
+                }
+                game.select_role(Role::Mavuika)?;
+                actions::execute_script(game, "attack(1.5)")?;
+            } else {
+                game.wait(300)?;
+            }
+            progress(report);
+        }
+    }
+
+    fn pickup_visible(
+        game: &mut Game<'_>,
+        progress: &MiningProgress<'_>,
+        report: &mut MiningReport,
+    ) -> Result<usize> {
+        let mut picked = 0;
+        let attribute_to_previous = report.phase == "moving";
+        for _ in 0..12 {
+            let frame = game.frame()?;
+            if game.record_loot(&frame, report)? && attribute_to_previous {
+                if let Some(last) = report.points.last_mut() {
+                    if last.route == report.route
+                        && last.method != "linnea"
+                        && last.outcome == "unconfirmed"
+                    {
+                        last.outcome = "collected".into();
+                    }
+                }
+            }
+            let mut prompts = Vec::new();
+            for (top, height) in super::super::vision::text_rows(&frame, 1070, 330, 530, 420) {
+                let text = game.read(&frame, 1070, top, 530, height)?;
+                if !text.trim().is_empty() {
+                    prompts.push((top, text));
+                }
+            }
+            if cfg!(debug_assertions) {
+                if let Ok(bytes) = serde_json::to_vec_pretty(&prompts) {
+                    let _ = super::super::routes::write_cache(
+                        std::path::Path::new("data/mining/last-pickup-prompts.json"),
+                        &bytes,
+                    );
+                }
+            }
+            // Only use an ore-labelled F prompt. Never select an unrelated
+            // NPC, quest or object merely because an interaction is available.
+            let is_ore = prompts.iter().any(|(top, text)| {
+                super::super::loot::ore_name(text).is_some()
+                    && game.motion.ore_prompt_key(&frame, *top, 42)
+            });
+            if !is_ore {
+                break;
+            }
+            report.phase = "pickingUp".into();
+            progress(report);
+            game.key(Key::Layout('f'))?;
+            picked += 1;
+            game.wait(200)?;
+        }
+        progress(report);
+        Ok(picked)
+    }
+
+    fn poll_loot(
+        game: &mut Game<'_>,
+        report: &mut MiningReport,
+        progress: &MiningProgress<'_>,
+        max_ms: u64,
+    ) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_millis(max_ms);
+        let mut last_gain = None;
+        while Instant::now() < deadline {
+            game.wait(200)?;
+            let frame = game.frame()?;
+            if game.record_loot(&frame, report)? {
+                last_gain = Some(Instant::now());
+            }
+            progress(report);
+            if last_gain
+                .is_some_and(|time| Instant::now().duration_since(time) >= Duration::from_secs(4))
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_nearby(
+        game: &mut Game<'_>,
+        sweep: bool,
+        progress: &MiningProgress<'_>,
+        report: &mut MiningReport,
+    ) -> Result<()> {
+        report.phase = "pickingUp".into();
+        progress(report);
+        pickup_visible(game, progress, report)?;
+        if sweep {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            for script in ["w(0.2)", "s(0.4)", "w(0.2)", "a(0.2)", "d(0.4)", "a(0.2)"] {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                actions::execute_script(game, script)?;
+                pickup_visible(game, progress, report)?;
+            }
+        }
+        poll_loot(game, report, progress, 2000)
+    }
+
+    fn finish_ground_mine(
+        game: &mut Game<'_>,
+        method: &str,
+        sweep: bool,
+        initial_loot: usize,
+        progress: &MiningProgress<'_>,
+        report: &mut MiningReport,
+    ) -> Result<()> {
+        game.wait(500)?;
+        let result = collect_nearby(game, sweep, progress, report);
+        report.points.push(MiningPointResult {
+            route: report.route.clone(),
+            waypoint: report.waypoint,
+            shots: 0,
+            method: method.into(),
+            outcome: if result.is_err() {
+                "interrupted"
+            } else if report.loot.values().sum::<usize>() > initial_loot {
+                "collected"
+            } else {
+                "unconfirmed"
+            }
+            .into(),
+        });
+        result
+    }
+
+    fn ground_mine(
+        game: &mut Game<'_>,
+        detector: &mut OreDetector,
+        strategy: MiningStrategy,
+        sweep: bool,
+        progress: &MiningProgress<'_>,
+        report: &mut MiningReport,
+    ) -> Result<()> {
+        if matches!(strategy, MiningStrategy::Linnea) {
+            return mine(game, detector, 1, 24, progress, report);
+        }
+        let initial_loot = report.loot.values().sum::<usize>();
+        if game.underwater_route {
+            game.press(GameKey::Skill)?;
+            return finish_ground_mine(game, "armoredCrab", sweep, initial_loot, progress, report);
+        }
+        report.phase = "breakingOre".into();
+        progress(report);
+        let method = if matches!(strategy, MiningStrategy::Zhongli) {
+            actions::execute_script(game, "钟离 e(hold)")?;
+            "zhongli"
+        } else {
+            game.select_role(Role::Mavuika)?;
+            for _ in 0..3 {
+                actions::execute_script(game, "attack(1.4)")?;
+                pickup_visible(game, progress, report)?;
+            }
+            "claymore"
+        };
+        finish_ground_mine(game, method, sweep, initial_loot, progress, report)
     }
 
     fn mine(
@@ -810,72 +1426,7 @@ mod windows {
                 game.ctrl.system_control.mouse_click()?;
                 report.shots += 1;
                 progress(report);
-                // One arrow can collect several ores. Poll the acquisition
-                // feed throughout Lumi's animation, de-duplicating visible rows.
-                let mut confirmed = std::collections::BTreeMap::<String, usize>::new();
-                let ore_names = [
-                    "铁块",
-                    "白铁块",
-                    "水晶块",
-                    "魔晶块",
-                    "紫晶块",
-                    "萃凝晶",
-                    "虹滴晶",
-                    "星银矿石",
-                ];
-                let loot_deadline = Instant::now() + Duration::from_secs(15);
-                let mut last_gain: Option<Instant> = None;
-                for poll in 0..75 {
-                    if Instant::now() >= loot_deadline {
-                        break;
-                    }
-                    game.wait(200)?;
-                    let frame = game.frame()?;
-                    if cfg!(debug_assertions) && poll % 10 == 0 {
-                        imageops::crop_imm(&frame, 70, 350, 460, 400)
-                            .to_image()
-                            .save(format!(
-                                "data/mining/last-loot-feed-{}.png",
-                                (poll / 10) % 5
-                            ))
-                            .ok();
-                    }
-                    let mut visible = std::collections::BTreeMap::<String, usize>::new();
-                    for (top, height) in super::super::vision::text_rows(&frame, 140, 370, 360, 340)
-                    {
-                        let text = game.read(&frame, 140, top, 360, height)?;
-                        // Prefer the longer name so 白铁块 does not become 铁块.
-                        if let Some(name) = ore_names
-                            .iter()
-                            .filter(|n| text.contains(**n))
-                            .max_by_key(|n| n.len())
-                        {
-                            let quantity = text.split_once(name).and_then(|(_, tail)| {
-                                tail.trim_start_matches(|c: char| {
-                                    c.is_whitespace() || matches!(c, '×' | 'x' | 'X' | '*')
-                                })
-                                .trim()
-                                .parse::<usize>()
-                                .ok()
-                            });
-                            if let Some(quantity) = quantity.filter(|q| (1..=99).contains(q)) {
-                                *visible.entry(name.to_string()).or_default() += quantity;
-                            }
-                        }
-                    }
-                    for (name, count) in visible {
-                        let previous = confirmed.entry(name.clone()).or_default();
-                        if count > *previous {
-                            *report.loot.entry(name).or_default() += count - *previous;
-                            *previous = count;
-                            last_gain = Some(Instant::now());
-                        }
-                    }
-                    progress(report);
-                    if last_gain.is_some_and(|time| time.elapsed() >= Duration::from_secs(4)) {
-                        break;
-                    }
-                }
+                poll_loot(game, report, progress, 15000)?;
             }
             Ok(())
         })();
@@ -905,6 +1456,7 @@ mod windows {
             route: report.route.clone(),
             waypoint: report.waypoint,
             shots,
+            method: "linnea".into(),
             outcome: if result.is_err() {
                 "interrupted"
             } else if report.loot.values().sum::<usize>() > initial_loot {

@@ -1,5 +1,8 @@
 //! Local route library and autonomous Linnea mining.
 pub mod actions;
+pub mod loot;
+mod motion;
+mod features;
 pub mod routes;
 pub mod runtime;
 mod vision;

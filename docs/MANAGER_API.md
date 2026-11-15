@@ -8,49 +8,71 @@ inventory; use `POST /scan` (including the recent-artifacts mode) to read data.
 
 ## Local mining
 
-Windows clients can run Linnea surface mining through the same execution queue
-as scans, equip operations and game input. `/mining/*` accepts native local
-clients and loopback browser origins. Native Mining controls use the same
-admission and execution queue directly within the application.
+Windows clients run native mineral routes through the same execution queue as
+scans, equip operations and game input. Mining controls also call that queue
+inside the application. Route execution does not require GGArtifact or BetterGI.
 
-- `GET /mining/routes` returns the cached route library, including `category`,
-  `region`, `capabilities` and per-waypoint `issues`.
-- `POST /mining/routes/refresh` recursively refreshes the BetterGI Linnea,
-  Rainbowdrop Crystal and Condessence Crystal collections at a pinned commit.
-- `POST /mining/routes/download` with `{"id":"..."}` downloads and validates a route.
-- `POST /mining/routes/import` with `{"path":"C:\\routes"}` imports JSON files or a directory.
-- `POST /mining/start` with `{"routeIds":["..."]}` runs downloaded compatible routes once, in request order. It returns HTTP 202 and `{"jobId":"..."}`. Competing operations return 409.
-- `POST /mining/start` with `{"routeIds":[],"stationary":true}` tests one ore cluster at the current position.
+- `GET /mining/routes` returns the local library with `category`, `region`,
+  `capabilities`, per-waypoint `issues` and optional `lastRun` evidence.
+- `POST /mining/routes/refresh` recursively refreshes Linnea, Rainbowdrop Crystal
+  and Condessence Crystal collections at a pinned community revision.
+- `POST /mining/routes/download` with `{"id":"..."}` downloads and checks a route.
+- `POST /mining/routes/import` with `{"path":"C:\\routes"}` imports JSON or a folder.
+- `POST /mining/start` with `{"routeIds":["..."]}` runs 1–100 downloaded compatible
+  routes once in order. HTTP 202 returns `{"jobId":"..."}`; competing tasks get 409.
+- `{"routeIds":[],"stationary":true,"strategy":"zhongli"}` tests the current
+  deposit. `strategy` accepts `auto`, `linnea`, `zhongli`, `claymore`. Auto uses
+  Mavuika's ordinary claymore attacks for generic `mining` points; explicitly
+  named scripts and `linnea_mining` preserve their required role.
 
-Routes must start at a teleport and use Teyvat surface coordinates. Supported
-movement is walk/run/dash, with path/target/orientation points and linnea_mining
-actions. Bounded `combat_script` instructions support waits, relative camera
-movement, game key presses/holds, mouse clicks, attacks and selecting the fixed
-Linnea/Zhongli/Mavuika/Dehya party roles. Script parsing completes before any
-input; unknown commands/keys are rejected. Held inputs are released on success,
-error, cancellation and unwinding. Each command is limited to 30 seconds, and
-each script to 128 commands/120 seconds. Orientation points turn the camera
-without moving toward the target.
-Unsupported actions are reported with their waypoint number before admission.
-Collections can contain underwater, underground, vehicle and ordinary-mining
-routes whose runtime capability is not yet available. These remain listed with
-explicit issues; downloading or parsing is not an in-game validation result.
-Initial in-game validation covers the community G09, G10 and G11 surface routes.
-Other compatible imports should be tested locally before a longer run.
-Linnea mining requires Linnea in the active party; named script roles must also
-be present. The runtime recognizes and selects their existing party slots.
-Acquisition counts require readable game notifications.
-Fired arrows without confirmed acquisition are reported as `unconfirmed`.
+The fixed role set is Linnea, Zhongli, Mavuika and Dehya. Bring the roles required
+by the selected routes; the runtime reads their existing party slots. It does
+not edit party presets or equipment. Ground mining includes cooldown waits,
+ore-labelled F prompts and a bounded nearby pickup sweep. Loot notifications
+are conservative lower bounds; use inventory comparisons for exact quantities.
+A shot, skill cast or completed walk without acquisition is `unconfirmed`.
 
-`GET /status` adds `mining` for mining jobs, including phase, route, waypoint,
-completedPoints, totalPoints, shots, point outcomes, confirmed loot, error and
-stopped. `GET /result?jobId=...` returns the final mining report for that job.
-Use the existing `POST /stop` with its current jobId to cancel. Focus loss also
-ends execution. Held movement keys and mouse buttons are released on exit.
-Route/model/map downloads are cached under `data/mining`. Mining does not save
-continuous screenshots. The latest summary is atomically saved to
-`data/mining/last-report.json`. Up to three failure screenshots are overwritten
-in that directory. Community route author/revision metadata remains local.
+Navigation supports walk/run/dash/jump, climbing, glider takeoff, `stop_flying`
+(plunge and landing HUD checks), and underwater horizontal movement with typed
+vertical key scripts. It confirms HUD transitions and fails bounded attempts.
+The big map requires agreeing SIFT features and a north-up geometric transform;
+mini-map tracking uses local terrain templates. Layer manifests include caves;
+optional `info.floor` disambiguates overlapping floors. An ambiguous floor
+stops the route. `mapFloor` reports the most recently confirmed floor.
+
+For Fontaine underwater routes, run the matching A00 acquisition route first.
+After visually confirming the borrowed **armored crab** icon, save it through
+`{"routeIds":[],"stationary":true,"calibrateCrab":true}` or the Mining tab's
+calibration button. This learns a local HUD reference, not the ability itself.
+Subsequent underwater E actions require an underwater HUD and a matching icon.
+Wrong/missing skills stop execution. SeaOfBygoneEras and AncientSacredMountain
+maps, saurian possession and scripts naming other characters remain unsupported.
+
+Bounded `combat_script` instructions support waits, camera movement, whitelisted
+game keys, mouse clicks and the four roles. Unknown commands are rejected before
+input. Each command is limited to 30 seconds; scripts to 128 commands/120 seconds.
+Held inputs release on completion, failure, cancellation and unwinding. Mavuika
+hold-E scripts check the mounted HUD and explicit E exits. `fight` uses a bounded
+Zhongli/Mavuika routine and requires enemy health bars to disappear before
+reporting clearance; no observed health bars is a separate outcome. These
+navigation/combat capabilities require local validation against each route.
+
+`issues` being empty means its instructions are implemented, not that the route
+has passed in the game. `lastRun` distinguishes `completedWithLoot`,
+`completedUnconfirmed`, `failed` and `stopped`, with waypoint counts, timestamp,
+loot and error. Evidence is invalidated when the cached route or engine revision
+changes. Completion with some loot does not confirm every deposit.
+
+`GET /status` exposes the mining phase, route, waypoint, completed/total points,
+shots, point methods/outcomes, loot, floor and error. Retrieve the final report
+with `GET /result?jobId=...`. Stop with `POST /stop` and its current jobId, then
+wait for termination before another input task. Focus loss also stops execution.
+Never automatically resubmit a start request after a transport timeout.
+
+Caches and the latest report stay in `data/mining`; per-route evidence is in
+`data/mining/validation`. Failure screenshots and development probes overwrite
+bounded filenames; mining does not create a continuous screenshot archive.
+Community authors and revisions remain attached to the local route catalog.
 
 ## Security
 

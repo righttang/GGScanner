@@ -49,6 +49,36 @@ pub(super) fn aiming_active(frame: &RgbImage) -> bool {
     white >= 450 && dark >= 40 && white + dark >= 650
 }
 
+/// Long, thin red bars in the scene; excludes the player HUD at the bottom.
+pub(super) fn enemy_health_bar(frame: &RgbImage) -> bool {
+    for y in 120..850 {
+        let mut run = 0;
+        for x in 240..1650 {
+            let p = frame.get_pixel(x, y);
+            let red = p[0] > 140
+                && p[1].abs_diff(p[2]) < 40
+                && p[0] as u16 > p[1] as u16 * 16 / 10
+                && p[0] as u16 > p[2] as u16 * 15 / 10;
+            if red {
+                run += 1;
+            } else {
+                run = 0;
+            }
+            if run >= 38 {
+                let lower = frame.get_pixel(x, y + 3);
+                let upper = frame.get_pixel(x, y.saturating_sub(8));
+                if lower[0] > 140
+                    && lower[0] as u16 > lower[1] as u16 * 16 / 10
+                    && upper[0] as u16 <= upper[1] as u16 * 16 / 10
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Horizontal bands of bright UI glyphs, with padding for a single-line OCR model.
 pub(super) fn text_rows(
     frame: &RgbImage,
@@ -168,6 +198,7 @@ fn atlas_to_world(x: f64, y: f64) -> (f64, f64) {
     ((32768.0 - x * 8.0) / 2.0, (24576.0 - y * 8.0) / 2.0)
 }
 
+#[cfg(test)]
 pub(super) fn big_map_scales() -> Vec<f64> {
     (10..=55).map(|n| n as f64 / 100.0).collect()
 }
@@ -405,6 +436,8 @@ pub(super) struct MiniMapLocator {
     layers: Vec<Layer>,
     loaded: std::collections::HashMap<String, Atlas>,
     scales: Vec<f64>,
+    pub last_floor: Option<i32>,
+    floor: Option<i32>,
 }
 
 fn confirms_mini_map_match(correlation: f64, displacement: f64, radius: f64) -> bool {
@@ -422,16 +455,27 @@ impl MiniMapLocator {
             "city_5_8_info.json",
             "city_6_0_info.json",
             "template_match_studio_cities.json",
+            "layer_map_info.json",
+            "layer_map_info_liyue.json",
+            "layer_map_5_8_info.json",
+            "layer_map_6_0_info.json",
+            "template_match_studio_layers.json",
         ] {
             let path = asset(&format!("BetterGI.Assets.Map/Assets/Map/Teyvat/{manifest}"))?;
             let records: Vec<Layer> = serde_json::from_slice(&std::fs::read(path)?)?;
-            layers.extend(records.into_iter().filter(|r| r.floor == 0));
+            layers.extend(records);
         }
         Ok(Self {
             layers,
             loaded: Default::default(),
             scales: vec![1.60, 1.6333, 1.666667, 1.70, 1.7333],
+            floor: None,
+            last_floor: None,
         })
+    }
+    pub fn set_floor(&mut self, floor: Option<i32>) {
+        self.floor = floor;
+        self.last_floor = None;
     }
 
     pub fn locate(
@@ -446,6 +490,9 @@ impl MiniMapLocator {
             .layers
             .iter()
             .filter(|r| {
+                if self.floor.is_some_and(|floor| r.floor != floor) {
+                    return false;
+                }
                 let dx = r.left - expected.0;
                 let dy = r.top - expected.1;
                 let extent = if r.scale > 1.0 { 900.0 } else { 8192.0 };
@@ -461,7 +508,8 @@ impl MiniMapLocator {
             })
         });
         let mut errors = Vec::new();
-        for layer in candidates.into_iter().take(4) {
+        let mut confirmed = Vec::new();
+        for layer in candidates.into_iter().take(16) {
             ensure!(!token.is_some_and(|t| t.check_rmb()), "Mining stopped");
             if !self.loaded.contains_key(&layer.layer_id) {
                 let path = asset(&format!(
@@ -498,7 +546,11 @@ impl MiniMapLocator {
                     // weaker terrain contrast; teleports and wide recovery
                     // searches still need the stronger match.
                     if confirms_mini_map_match(correlation, displacement, radius) {
-                        return Ok((x, y));
+                        if self.floor.is_some() {
+                            self.last_floor = Some(layer.floor);
+                            return Ok((x, y));
+                        }
+                        confirmed.push((correlation, x, y, layer.floor));
                     }
                     errors.push(format!(
                         "{}: uncertain map match (correlation {correlation:.3}, displacement {displacement:.2})",
@@ -508,7 +560,19 @@ impl MiniMapLocator {
                 Err(error) => errors.push(format!("{}: {error}", layer.layer_id)),
             }
         }
-        anyhow::bail!("Surface map position unconfirmed: {}", errors.join("; "))
+        confirmed.sort_by(|a, b| b.0.total_cmp(&a.0));
+        if let Some(best) = confirmed.first() {
+            ensure!(
+                !confirmed
+                    .iter()
+                    .skip(1)
+                    .any(|other| other.3 != best.3 && best.0 - other.0 < 0.04),
+                "Mini-map floor is ambiguous; specify info.floor for this route"
+            );
+            self.last_floor = Some(best.3);
+            return Ok((best.1, best.2));
+        }
+        anyhow::bail!("Map position or floor unconfirmed: {}", errors.join("; "))
     }
 }
 

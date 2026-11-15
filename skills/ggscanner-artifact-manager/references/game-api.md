@@ -19,17 +19,20 @@ Skill 后可读 [在线规范](https://github.com/righttang/GGScanner/blob/main/
 
 ## 挖矿
 
-由 Scanner 在本机执行。当前支持 Windows、莉奈娅采矿和提瓦特地面路线中的已适配动作。
+由 Scanner 在本机执行。支持 Windows 的原生矿物路线控制；包含地面、滑翔、攀爬、水下、分层地图及固定队伍的已适配动作，逐路线核验实机效果。
 莉奈娅采矿须携带莉奈娅；点位脚本指定的角色也须在出战队伍中。用本机“挖矿”页或以下高层接口；执行期间只查询状态，
 不要另发移动、瞄准或射击脚本。
 
-- `GET /mining/routes` 读取路线 ID、作者、矿种 `category`、地区 `region`、所需动作 `capabilities`、缓存状态和不支持点位。
+- `GET /mining/routes` 读取路线 ID、作者、矿种 `category`、地区 `region`、所需动作 `capabilities`、缓存状态、不支持点位和 `lastRun` 实测记录。
 - `POST /mining/routes/refresh` 用 `{}` 递归更新莉奈娅、虹滴晶和萃凝晶目录；`/download` 用 `{"id":"..."}`
   下载并检查，`/import` 用 `{"path":"C:\\routes"}` 导入本地 JSON 或文件夹。
 - 只选已下载且 `issues` 为空的路线。先在矿点用
   `POST /mining/start` 的 `{"routeIds":[],"stationary":true}` 试采；路线任务用
   `{"routeIds":["已检查的ID"]}`，按请求顺序各运行一次。
-- `issues` 为空只表示已适配该路线的指令，实机效果仍须看回执。水下、地下、载具和通用碎矿拾取等未完成能力会继续列出具体阻塞点，不按“下载成功”判断可用。
+- `issues` 为空只表示指令已适配。查看 `lastRun` 区分走完且有收获提示、走完但收获未确认、失败和停止；路线或引擎版本变化后旧记录失效。
+- 通用采矿 `strategy` 可用 `auto`、`linnea`、`zhongli`、`claymore`；auto 的通用碎矿使用玛薇卡普通大剑攻击。固定队伍为玛薇卡、迪希雅、莉奈娅、钟离，路线写明角色时仍按路线执行。
+- 水下先跑对应 A00 学习技能路线。观察确认已借到重甲蟹技能后，用 `{"routeIds":[],"stationary":true,"calibrateCrab":true}` 保存本机图标参照，再运行采矿路线。参照只用于识别，不能授予技能；错误技能会停止，不在水下轮转地面护盾。
+- 重叠地层不明确时停止；本地路线可用 `info.floor` 指定楼层。旧日之海、远古圣山、龙附身和额外角色脚本仍列出限制，不宣称所有社区路线都能完成。
 - 202 后轮询 `/status`，用当前 jobId 查询 `/result` 或 `/stop`。网络超时先查状态，
   不自动重发开始请求。右键也可停止；焦点丢失会结束任务。
 - 检查每个矿点的 `outcome`、`shots`、`loot` 和 `error`。射箭不等于收获，

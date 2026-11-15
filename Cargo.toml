@@ -15,3 +15,9 @@ auto-artifactarium = { path = "vendor/auto-artifactarium" }
 lto = true
 panic = "unwind"
 strip = true
+
+# Feature extraction must stay responsive in local development builds too.
+[profile.dev.package.sift-features]
+opt-level = 3
+[profile.dev.package.imageproc]
+opt-level = 3

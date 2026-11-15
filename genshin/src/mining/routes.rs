@@ -33,6 +33,8 @@ pub struct RouteInfo {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,7 +154,7 @@ impl Route {
         if !matches!(self.info.map_name.as_str(), "" | "Teyvat") {
             issues.push(format!("Unsupported map: {}", self.info.map_name));
         }
-        if self.environment() != "ground" {
+        if !matches!(self.environment(), "ground" | "underwater" | "underground") {
             issues.push(format!(
                 "Navigation capability pending: {}",
                 self.environment()
@@ -168,42 +170,42 @@ impl Route {
                         issues.push(format!("Waypoint {}: {error}", index + 1));
                         continue;
                     },
-                    Ok(actions) => {
-                        let mut role = None;
-                        for action in actions {
-                            match action {
-                                super::actions::Action::Select { role: selected } => {
-                                    role = Some(selected)
-                                },
-                                super::actions::Action::Hold {
-                                    key: super::actions::GameKey::Skill,
-                                    ..
-                                } => {
-                                    if role == Some(super::actions::Role::Zhongli) {
-                                        issues.push(format!(
-                                            "Waypoint {}: Mining capability pending: nearbyPickup",
-                                            index + 1
-                                        ));
-                                    } else if role == Some(super::actions::Role::Mavuika) {
-                                        issues.push(format!(
-                                            "Waypoint {}: Navigation capability pending: vehicle",
-                                            index + 1
-                                        ));
-                                    }
-                                },
-                                _ => {},
-                            }
-                        }
-                    },
+                    Ok(_) => {},
                 }
             }
             let valid = matches!(
                 p.kind.as_str(),
                 "teleport" | "path" | "target" | "orientation"
-            ) && matches!(p.move_mode.as_str(), "walk" | "run" | "dash")
-                && matches!(p.action.as_str(), "" | "linnea_mining" | "combat_script")
-                && (p.action != "linnea_mining" || p.shots().is_ok())
+            ) && matches!(
+                p.move_mode.as_str(),
+                "walk" | "run" | "dash" | "jump" | "fly" | "climb" | "swim"
+            ) && matches!(
+                p.action.as_str(),
+                "" | "linnea_mining"
+                    | "combat_script"
+                    | "mining"
+                    | "pick_around"
+                    | "stop_flying"
+                    | "fight"
+                    | "force_tp"
+            ) && (p.action != "linnea_mining" || p.shots().is_ok())
+                && (p.action != "mining"
+                    || matches!(p.action_params.as_str(), "" | "disablePickupAround"))
+                && (p.action != "pick_around"
+                    || p.action_params.is_empty()
+                    || p.action_params
+                        .parse::<usize>()
+                        .is_ok_and(|n| (1..=3).contains(&n)))
                 && (p.action != "" || p.action_params.is_empty());
+            let valid = valid
+                && match p.action.as_str() {
+                    "stop_flying" => {
+                        p.action_params.is_empty()
+                            || p.action_params.parse::<u64>().is_ok_and(|v| v <= 5000)
+                    },
+                    "fight" | "force_tp" => p.action_params.is_empty(),
+                    _ => true,
+                };
             if !valid {
                 issues.push(format!(
                     "Waypoint {}: {} · {} · {} ({})",
@@ -237,6 +239,29 @@ pub struct RouteEntry {
     pub region: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<RouteValidation>,
+}
+
+pub const ENGINE_REVISION: &str = "mining-20261116-v2";
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteValidation {
+    pub engine_revision: String,
+    pub route_fingerprint: String,
+    pub finished_at: u64,
+    pub outcome: String,
+    pub completed_points: usize,
+    pub total_points: usize,
+    pub loot: BTreeMap<String, usize>,
+    pub error: Option<String>,
+}
+
+fn fingerprint(bytes: &[u8]) -> String {
+    let value = bytes.iter().fold(0xcbf29ce484222325u64, |hash, b| {
+        (hash ^ *b as u64).wrapping_mul(0x100000001b3)
+    });
+    format!("{value:016x}")
 }
 
 fn category(path: &str) -> &'static str {
@@ -338,6 +363,18 @@ impl RouteStore {
                     },
                 }
             }
+            entry.last_run = std::fs::read(
+                self.root
+                    .join("validation")
+                    .join(format!("{}.json", entry.id)),
+            )
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RouteValidation>(&bytes).ok())
+            .filter(|run| {
+                run.engine_revision == ENGINE_REVISION
+                    && std::fs::read(self.path(&entry.id).unwrap())
+                        .is_ok_and(|bytes| fingerprint(&bytes) == run.route_fingerprint)
+            });
             entry.source_metadata();
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -351,6 +388,14 @@ impl RouteStore {
     }
     fn save_route(&self, id: &str, route: &Route) -> Result<()> {
         write_cache(&self.path(id)?, &serde_json::to_vec_pretty(route)?)
+    }
+    pub fn record_run(&self, id: &str, mut validation: RouteValidation) -> Result<()> {
+        validation.route_fingerprint = fingerprint(&std::fs::read(self.path(id)?)?);
+        validation.engine_revision = ENGINE_REVISION.into();
+        write_cache(
+            &self.root.join("validation").join(format!("{id}.json")),
+            &serde_json::to_vec_pretty(&validation)?,
+        )
     }
     pub fn import(&self, path: &Path) -> Result<Vec<RouteEntry>> {
         let mut paths = if path.is_dir() {
@@ -385,6 +430,7 @@ impl RouteStore {
                 category: category(&path.to_string_lossy().replace('\\', "/")).into(),
                 region: region(&format!("{}/{}", path.display(), route.info.name)).into(),
                 capabilities: route.required_capabilities(),
+                last_run: None,
             });
         }
         self.save_list(&entries)?;
@@ -531,6 +577,48 @@ pub(crate) fn write_cache(path: &Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn edited_routes_invalidate_previous_live_evidence() {
+        let root =
+            std::env::temp_dir().join(format!("ggscanner-evidence-{}", uuid::Uuid::new_v4()));
+        let store = RouteStore::new(root.clone());
+        let mut route = route("path", "combat_script", "wait(1)");
+        store.save_route("case", &route).unwrap();
+        store
+            .save_list(&[RouteEntry {
+                id: "case".into(),
+                ..Default::default()
+            }])
+            .unwrap();
+        store
+            .record_run(
+                "case",
+                RouteValidation {
+                    engine_revision: String::new(),
+                    route_fingerprint: String::new(),
+                    finished_at: 1,
+                    outcome: "failed".into(),
+                    completed_points: 1,
+                    total_points: 2,
+                    loot: Default::default(),
+                    error: Some("test failure".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.list().unwrap()[0].last_run.as_ref().unwrap().outcome,
+            "failed"
+        );
+        route.positions[1].action_params = "wait(2)".into();
+        store.save_route("case", &route).unwrap();
+        assert!(store.list().unwrap()[0].last_run.is_none());
+        std::fs::remove_file(store.path("case").unwrap()).unwrap();
+        std::fs::remove_file(root.join("validation/case.json")).unwrap();
+        std::fs::remove_file(root.join("catalog.json")).unwrap();
+        std::fs::remove_dir(root.join("routes")).unwrap();
+        std::fs::remove_dir(root.join("validation")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
     fn route(kind: &str, action: &str, params: &str) -> Route {
         Route {
             info: RouteInfo {
@@ -575,8 +663,9 @@ mod tests {
             .is_empty());
         assert!(route("path", "combat_script", "钟离 e(hold)")
             .issues()
-            .iter()
-            .any(|issue| issue.contains("nearbyPickup")));
+            .is_empty());
+        assert!(route("target", "mining", "").issues().is_empty());
+        assert!(!route("target", "pick_around", "999").issues().is_empty());
         assert!(!route("path", "linnea_mining", "2.2").issues().is_empty());
         assert_eq!(
             route("orientation", "linnea_mining", "3,1").positions[1]
@@ -606,7 +695,7 @@ mod tests {
         }
     }
     #[test]
-    fn underwater_context_survives_serialization_and_is_not_admitted_as_ground() {
+    fn underwater_context_survives_serialization_with_its_required_capability() {
         let mut route = route("path", "combat_script", "wait(3)");
         route.source_hint("repo/pathing/矿物/萃凝晶/枫丹水下/A01.json");
         let round_trip = Route::parse(&serde_json::to_vec(&route).unwrap()).unwrap();
@@ -614,10 +703,12 @@ mod tests {
         assert!(round_trip
             .required_capabilities()
             .contains(&"underwater".into()));
-        assert!(round_trip
+        assert!(round_trip.issues().is_empty());
+        route.info.map_name = "SeaOfBygoneEras".into();
+        assert!(route
             .issues()
             .iter()
-            .any(|issue| issue.contains("underwater")));
+            .any(|issue| issue.contains("Unsupported map")));
     }
     #[test]
     fn malformed_cached_route_does_not_hide_other_routes() {
