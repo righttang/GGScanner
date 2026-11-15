@@ -51,26 +51,36 @@ pub(super) fn aiming_active(frame: &RgbImage) -> bool {
 
 /// Long, thin red bars in the scene; excludes the player HUD at the bottom.
 pub(super) fn enemy_health_bar(frame: &RgbImage) -> bool {
+    // Enemy HP fills are flat pink UI rectangles. Fire and Mavuika's ring can
+    // contain long red edges, so redness alone is not evidence of an enemy.
     for y in 120..850 {
         let mut run = 0;
+        let mut first = [0u8; 3];
         for x in 240..1650 {
-            let p = frame.get_pixel(x, y);
-            let red = p[0] > 140
-                && p[1].abs_diff(p[2]) < 40
-                && p[0] as u16 > p[1] as u16 * 16 / 10
+            let p = frame.get_pixel(x, y).0;
+            let red = p[0] >= 170
+                && (35..=125).contains(&p[1])
+                && p[2] as u16 >= p[1] as u16 + 8
                 && p[0] as u16 > p[2] as u16 * 15 / 10;
-            if red {
+            if red && (run == 0 || (0..3).all(|i| p[i].abs_diff(first[i]) <= 20)) {
+                if run == 0 {
+                    first = p;
+                }
                 run += 1;
             } else {
                 run = 0;
             }
-            if run >= 38 {
-                let lower = frame.get_pixel(x, y + 3);
-                let upper = frame.get_pixel(x, y.saturating_sub(8));
-                if lower[0] > 140
-                    && lower[0] as u16 > lower[1] as u16 * 16 / 10
-                    && upper[0] as u16 <= upper[1] as u16 * 16 / 10
-                {
+            if run == 38 {
+                let uniform_columns = (x - 33..x - 3)
+                    .filter(|&column| {
+                        let middle = frame.get_pixel(column, y);
+                        [y + 1, y + 2].into_iter().all(|row| {
+                            let next = frame.get_pixel(column, row);
+                            (0..3).all(|i| middle[i].abs_diff(next[i]) < 25)
+                        })
+                    })
+                    .count();
+                if uniform_columns >= 26 {
                     return true;
                 }
             }
@@ -629,6 +639,24 @@ pub(super) fn estimate_camera_rotation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires local enemy HP and Mavuika ring regression frames"]
+    fn distinguish_local_enemy_bar_from_pyro_ring() {
+        let positive = image::open(std::env::var("GGSCANNER_ENEMY_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let negative = image::open(std::env::var("GGSCANNER_PYRO_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        assert!(
+            enemy_health_bar(&positive),
+            "Visible enemy HP must be detected"
+        );
+        assert!(
+            !enemy_health_bar(&negative),
+            "Pyro effects must not create an enemy HP bar"
+        );
+    }
     #[test]
     fn map_pan_avoids_bright_markers_at_the_drag_origin() {
         let mut frame = RgbImage::from_pixel(1920, 1080, image::Rgb([70, 90, 100]));
