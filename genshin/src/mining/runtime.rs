@@ -1294,6 +1294,10 @@ mod windows {
                     last_fire = Some(Instant::now());
                 }
                 actions::execute_script(game, "attack(1.5)")?;
+            } else if saw_enemy {
+                // Finish a nearly depleted bar before the clearance window;
+                // its final few pixels may be below the vision threshold.
+                actions::execute_script(game, "attack(0.35)")?;
             } else {
                 game.wait(300)?;
             }

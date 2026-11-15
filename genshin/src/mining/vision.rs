@@ -58,11 +58,10 @@ pub(super) fn enemy_health_bar(frame: &RgbImage) -> bool {
         let mut first = [0u8; 3];
         for x in 240..1650 {
             let p = frame.get_pixel(x, y).0;
-            let red = p[0] >= 170
-                && (35..=125).contains(&p[1])
-                && p[2] as u16 >= p[1] as u16 + 8
-                && p[0] as u16 > p[2] as u16 * 15 / 10;
-            if red && (run == 0 || (0..3).all(|i| p[i].abs_diff(first[i]) <= 20)) {
+            let red = p[0] >= 235
+                && (50..=90).contains(&p[1])
+                && (10..=30).contains(&(p[2] as i16 - p[1] as i16));
+            if red && (run == 0 || (0..3).all(|i| p[i].abs_diff(first[i]) <= 8)) {
                 if run == 0 {
                     first = p;
                 }
@@ -71,16 +70,30 @@ pub(super) fn enemy_health_bar(frame: &RgbImage) -> bool {
                 run = 0;
             }
             if run == 38 {
-                let uniform_columns = (x - 33..x - 3)
-                    .filter(|&column| {
-                        let middle = frame.get_pixel(column, y);
-                        [y + 1, y + 2].into_iter().all(|row| {
-                            let next = frame.get_pixel(column, row);
-                            (0..3).all(|i| middle[i].abs_diff(next[i]) < 25)
-                        })
-                    })
-                    .count();
-                if uniform_columns >= 26 {
+                let center = x - run / 2;
+                let color = frame.get_pixel(center, y).0;
+                let similar = |column, row| {
+                    let pixel = frame.get_pixel(column, row).0;
+                    (0..3).all(|i| pixel[i].abs_diff(color[i]) <= 8)
+                };
+                let (mut top, mut bottom) = (y, y);
+                while top > 100 && y - top < 20 && similar(center, top - 1) {
+                    top -= 1;
+                }
+                while bottom < 870 && bottom - y < 20 && similar(center, bottom + 1) {
+                    bottom += 1;
+                }
+                let height = bottom - top + 1;
+                if !(3..=18).contains(&height) || run < 2 * height {
+                    continue;
+                }
+                let columns = x - run + 4..x - 4;
+                let area = (run - 8) * height;
+                let filled = columns
+                    .flat_map(|column| (top..=bottom).map(move |row| (column, row)))
+                    .filter(|&(column, row)| similar(column, row))
+                    .count() as u32;
+                if filled * 10 >= area * 9 {
                     return true;
                 }
             }
@@ -656,6 +669,13 @@ mod tests {
             !enemy_health_bar(&negative),
             "Pyro effects must not create an enemy HP bar"
         );
+        if let Ok(path) = std::env::var("GGSCANNER_PYRO_EXTRA_FRAME") {
+            let frame = image::open(path).unwrap().to_rgb8();
+            assert!(
+                !enemy_health_bar(&frame),
+                "Red scenery must not create an enemy HP bar"
+            );
+        }
     }
     #[test]
     fn map_pan_avoids_bright_markers_at_the_drag_origin() {
