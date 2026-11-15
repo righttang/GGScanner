@@ -379,7 +379,6 @@ mod windows {
                         position.context("Missing teleport position")?,
                         (point.x, point.y),
                         point.move_mode != "walk",
-                        point.kind == "target",
                     )?);
                 }
                 if point.action == "linnea_mining" {
@@ -411,11 +410,24 @@ mod windows {
     fn camera_heading(game: &mut Game<'_>) -> Result<(f64, f64)> {
         // Camera rotation changes the mini-map's viewing cone, while terrain
         // stays still. Difference the two frames to remove terrain brightness.
-        let before = game.frame()?;
-        game.rotate(160.0, 0.0)?;
-        let after = game.frame()?;
-        game.rotate(-160.0, 0.0)?;
-        super::super::vision::estimate_camera_rotation(&before, &after)
+        let mut last_error = None;
+        for pixels in [160.0, 320.0] {
+            let before = game.frame()?;
+            game.rotate(pixels, 0.0)?;
+            let after = game.frame()?;
+            game.rotate(-pixels, 0.0)?;
+            match super::super::vision::estimate_camera_rotation(&before, &after, pixels) {
+                Ok(heading) => return Ok(heading),
+                Err(error) => {
+                    if cfg!(debug_assertions) {
+                        before.save("data/mining/last-camera-before.png").ok();
+                        after.save("data/mining/last-camera-after.png").ok();
+                    }
+                    last_error = Some(error);
+                },
+            }
+        }
+        Err(last_error.unwrap()).context("Camera calibration failed after two probes")
     }
 
     fn angle_difference(target: f64, current: f64) -> f64 {
@@ -451,13 +463,13 @@ mod windows {
         mut current: (f64, f64),
         target: (f64, f64),
         sprint: bool,
-        precise: bool,
     ) -> Result<(f64, f64)> {
         let started = Instant::now();
         let mut movement = MovementProgress::new(current);
+        let mut recovery_used = false;
         loop {
             let distance = (target.0 - current.0).hypot(target.1 - current.1);
-            if distance < if precise { 2.0 } else { 4.0 } {
+            if distance < 2.0 {
                 return Ok(current);
             }
             ensure!(
@@ -476,7 +488,28 @@ mod windows {
                 (current.0 - next.0).hypot(current.1 - next.1) < 24.0,
                 "Mini-map position jumped unexpectedly"
             );
-            movement.observe(next)?;
+            if let Err(error) = movement.observe(next) {
+                if recovery_used {
+                    return Err(error)
+                        .with_context(|| format!("Target {target:?}; observed {next:?}"));
+                }
+                recovery_used = true;
+                yas::log_info!(
+                    "挖矿行进受阻，尝试一次短跳脱困",
+                    "Mining path blocked; attempting one short jump"
+                );
+                game.key(Key::Space)?;
+                game.forward(450, false)?;
+                game.wait(900)?;
+                current = locate(game, mini_locator, Some(next), 20)
+                    .or_else(|_| locate(game, mini_locator, Some(next), 60))?;
+                ensure!(
+                    (current.0 - next.0).hypot(current.1 - next.1) < 24.0,
+                    "Mini-map position jumped unexpectedly during recovery"
+                );
+                movement = MovementProgress::new(current);
+                continue;
+            }
             current = next;
         }
     }
@@ -528,7 +561,7 @@ mod windows {
         for _ in 0..40 {
             let frame = game.frame()?;
             let patch = imageops::crop_imm(&frame, 660, 330, 600, 420).to_image();
-            let (x, y, scale) = atlas.locate(
+            let (x, y, scale, _) = atlas.locate(
                 &patch,
                 None,
                 10000,

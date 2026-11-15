@@ -172,6 +172,31 @@ pub(super) fn big_map_scales() -> Vec<f64> {
     (10..=55).map(|n| n as f64 / 100.0).collect()
 }
 
+fn mini_map_overlay_mask(query: &RgbImage) -> GrayImage {
+    let mut mask = GrayImage::new(query.width(), query.height());
+    let is_marker = |pixel: &image::Rgb<u8>| {
+        pixel.0.iter().all(|&channel| channel > 205)
+            || (pixel[0] < 110 && pixel[1] > 180 && pixel[2] > 180)
+    };
+    for (x, y, pixel) in query.enumerate_pixels() {
+        if x + 1 < query.width()
+            && y + 1 < query.height()
+            && is_marker(pixel)
+            && is_marker(query.get_pixel(x + 1, y))
+            && is_marker(query.get_pixel(x, y + 1))
+            && is_marker(query.get_pixel(x + 1, y + 1))
+        {
+            // Include the dark outline around bright map icons as well.
+            for sy in y.saturating_sub(3)..=(y + 4).min(query.height() - 1) {
+                for sx in x.saturating_sub(3)..=(x + 4).min(query.width() - 1) {
+                    mask.put_pixel(sx, sy, image::Luma([255]));
+                }
+            }
+        }
+    }
+    mask
+}
+
 pub(super) struct Atlas {
     pub image: GrayImage,
     origin: (f64, f64),
@@ -203,8 +228,9 @@ impl Atlas {
         scales: &[f64],
         circular: bool,
         cancel: Option<&yas::cancel::CancelToken>,
-    ) -> Result<(f64, f64, f64)> {
+    ) -> Result<(f64, f64, f64, f64)> {
         let gray = imageops::grayscale(query);
+        let overlay_mask = circular.then(|| mini_map_overlay_mask(query));
         let (ax, ay) = center
             .map(|p| {
                 (
@@ -224,7 +250,11 @@ impl Atlas {
                 continue;
             }
             let small = imageops::resize(&gray, w, h, FilterType::Triangle);
+            let mask = overlay_mask
+                .as_ref()
+                .map(|mask| imageops::resize(mask, w, h, FilterType::Nearest));
             let mut samples = Vec::new();
+            let mut available = 0;
             let sample_stride = (w.max(h) / 16).max(2) as usize;
             for y in (2..h - 2).step_by(sample_stride) {
                 for x in (2..w - 2).step_by(sample_stride) {
@@ -232,6 +262,13 @@ impl Atlas {
                         + (y as f64 / h as f64 - 0.5).powi(2))
                     .sqrt();
                     if !circular || (0.12..0.44).contains(&d) {
+                        available += 1;
+                        if mask
+                            .as_ref()
+                            .is_some_and(|mask| mask.get_pixel(x, y)[0] != 0)
+                        {
+                            continue;
+                        }
                         samples.push((
                             x as i32 - w as i32 / 2,
                             y as i32 - h as i32 / 2,
@@ -239,6 +276,9 @@ impl Atlas {
                         ));
                     }
                 }
+            }
+            if samples.len() < 32 || samples.len() * 100 < available * 40 {
+                continue;
             }
             let n = samples.len() as f64;
             let mean = samples.iter().map(|p| p.2).sum::<f64>() / n;
@@ -305,16 +345,19 @@ impl Atlas {
                 best = (candidate.0, candidate.1 as f64, candidate.2 as f64, scale);
             }
         }
-        ensure!(
-            best.0 >= self.minimum_correlation,
-            "Map location unconfirmed (correlation {:.3})",
-            best.0
-        );
         let world = (
             (self.origin.0 - best.1) / self.world_scale,
             (self.origin.1 - best.2) / self.world_scale,
         );
-        Ok((world.0, world.1, best.3))
+        ensure!(
+            best.0 >= self.minimum_correlation,
+            "Map location unconfirmed (correlation {:.3}, position {:.2}/{:.2}, scale {:.3})",
+            best.0,
+            world.0,
+            world.1,
+            best.3
+        );
+        Ok((world.0, world.1, best.3, best.0))
     }
 }
 
@@ -334,6 +377,10 @@ pub(super) struct MiniMapLocator {
     layers: Vec<Layer>,
     loaded: std::collections::HashMap<String, Atlas>,
     scales: Vec<f64>,
+}
+
+fn confirms_mini_map_match(correlation: f64, displacement: f64, radius: f64) -> bool {
+    correlation >= 0.65 || (correlation >= 0.60 && radius <= 40.0 && displacement <= 12.0)
 }
 
 impl MiniMapLocator {
@@ -403,7 +450,7 @@ impl MiniMapLocator {
                         image,
                         origin: (layer.left * layer.scale, layer.top * layer.scale),
                         world_scale: layer.scale,
-                        minimum_correlation: if layer.scale > 1.0 { 0.65 } else { 0.70 },
+                        minimum_correlation: 0.60,
                     },
                 );
             }
@@ -417,7 +464,19 @@ impl MiniMapLocator {
                 token,
             );
             match result {
-                Ok((x, y, _)) => return Ok((x, y)),
+                Ok((x, y, _, correlation)) => {
+                    let displacement = (x - expected.0).hypot(y - expected.1);
+                    // A short walking pulse can retain a nearby position with
+                    // weaker terrain contrast; teleports and wide recovery
+                    // searches still need the stronger match.
+                    if confirms_mini_map_match(correlation, displacement, radius) {
+                        return Ok((x, y));
+                    }
+                    errors.push(format!(
+                        "{}: uncertain map match (correlation {correlation:.3}, displacement {displacement:.2})",
+                        layer.layer_id
+                    ));
+                },
                 Err(error) => errors.push(format!("{}: {error}", layer.layer_id)),
             }
         }
@@ -425,7 +484,11 @@ impl MiniMapLocator {
     }
 }
 
-pub(super) fn estimate_camera_rotation(before: &RgbImage, after: &RgbImage) -> Result<(f64, f64)> {
+pub(super) fn estimate_camera_rotation(
+    before: &RgbImage,
+    after: &RgbImage,
+    probe_pixels: f64,
+) -> Result<(f64, f64)> {
     let mut delta = [0.0; 360];
     for (degree, value) in delta.iter_mut().enumerate() {
         let angle = (degree as f64).to_radians();
@@ -453,7 +516,11 @@ pub(super) fn estimate_camera_rotation(before: &RgbImage, after: &RgbImage) -> R
             }
         }
     }
-    ensure!(best.0 > 1500.0, "Camera heading could not be confirmed");
+    ensure!(
+        best.0 > 1500.0,
+        "Camera heading could not be confirmed (score {:.1})",
+        best.0
+    );
     yas::log_debug!(
         "挖矿镜头校准：朝向 {}，转角 {}，匹配分数 {}",
         "Mining camera calibration: heading {}, turn {}, match score {}",
@@ -463,13 +530,65 @@ pub(super) fn estimate_camera_rotation(before: &RgbImage, after: &RgbImage) -> R
     );
     Ok((
         ((best.1 - best.2) as f64).to_radians(),
-        160.0 / best.2 as f64,
+        probe_pixels / best.2 as f64,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn weak_mini_map_matches_require_continuous_motion_and_cannot_confirm_teleports() {
+        assert!(confirms_mini_map_match(0.620, 4.0, 20.0));
+        assert!(!confirms_mini_map_match(0.620, 4.0, 50.0));
+        assert!(!confirms_mini_map_match(0.620, 13.0, 20.0));
+        assert!(!confirms_mini_map_match(0.59, 1.0, 20.0));
+        assert!(confirms_mini_map_match(0.691, 1.8, 50.0));
+    }
+    #[test]
+    fn mini_map_masks_bright_icons_with_their_outline() {
+        let mut query = RgbImage::from_pixel(40, 40, image::Rgb([80, 130, 90]));
+        for offset_y in 0..2 {
+            for offset_x in 0..2 {
+                query.put_pixel(10 + offset_x, 10 + offset_y, image::Rgb([245, 245, 245]));
+                query.put_pixel(30 + offset_x, 30 + offset_y, image::Rgb([40, 230, 250]));
+            }
+        }
+        let mask = mini_map_overlay_mask(&query);
+        assert_eq!(mask.get_pixel(10, 10)[0], 255);
+        assert_eq!(mask.get_pixel(13, 13)[0], 255);
+        assert_eq!(mask.get_pixel(27, 27)[0], 255);
+        assert_eq!(mask.get_pixel(20, 20)[0], 0);
+    }
+    #[test]
+    fn localizes_terrain_under_map_icons_and_rejects_fully_obscured_maps() {
+        let atlas = Atlas {
+            image: GrayImage::from_fn(400, 400, |x, y| {
+                image::Luma([(((x * 17) ^ (y * 23) ^ (x * y)) % 145 + 30) as u8])
+            }),
+            origin: (400.0, 400.0),
+            world_scale: 1.0,
+            minimum_correlation: 0.70,
+        };
+        let crop = imageops::crop_imm(&atlas.image, 158, 158, 84, 84).to_image();
+        let mut query = image::DynamicImage::ImageLuma8(crop).to_rgb8();
+        for (cx, color) in [(15u32, [245, 245, 245]), (66, [40, 230, 250])] {
+            for y in 37u32..=47 {
+                for x in cx - 5..=cx + 5 {
+                    let edge = x.abs_diff(cx) > 2 || y.abs_diff(42) > 2;
+                    query.put_pixel(x, y, image::Rgb(if edge { [20, 30, 40] } else { color }));
+                }
+            }
+        }
+        let found = atlas
+            .locate(&query, Some((200.0, 200.0)), 20, &[1.0], true, None)
+            .unwrap();
+        assert_eq!((found.0, found.1), (200.0, 200.0));
+        let obscured = RgbImage::from_pixel(84, 84, image::Rgb([245, 245, 245]));
+        assert!(atlas
+            .locate(&obscured, Some((200.0, 200.0)), 20, &[1.0], true, None)
+            .is_err());
+    }
     #[test]
     fn bright_terrain_does_not_enter_or_toggle_aiming_state() {
         let cliff = RgbImage::from_pixel(1920, 1080, image::Rgb([255, 255, 255]));
@@ -509,18 +628,21 @@ mod tests {
                     image::Rgb([value, value, value])
                 })
             };
-            let (actual, sensitivity) = estimate_camera_rotation(
-                &scene(heading),
-                &scene((heading + 22.0).rem_euclid(360.0)),
-            )
-            .unwrap();
-            let error = (actual.to_degrees() - heading + 180.0).rem_euclid(360.0) - 180.0;
-            assert!(
-                error.abs() < 3.0,
-                "Expected {heading}, got {}",
-                actual.to_degrees()
-            );
-            assert!((sensitivity - 160.0 / 22.0).abs() < 0.7);
+            for (pixels, turn) in [(160.0, 22.0), (320.0, 44.0)] {
+                let (actual, sensitivity) = estimate_camera_rotation(
+                    &scene(heading),
+                    &scene((heading + turn).rem_euclid(360.0)),
+                    pixels,
+                )
+                .unwrap();
+                let error = (actual.to_degrees() - heading + 180.0).rem_euclid(360.0) - 180.0;
+                assert!(
+                    error.abs() < 3.0,
+                    "Expected {heading}, got {}",
+                    actual.to_degrees()
+                );
+                assert!((sensitivity - pixels / turn).abs() < 0.7);
+            }
         }
     }
     #[test]
@@ -533,19 +655,27 @@ mod tests {
             &std::fs::read(std::env::var("GGSCANNER_MINING_ROUTE_FILE").unwrap()).unwrap(),
         )
         .unwrap();
-        let point = &route.positions[0];
+        let waypoint = std::env::var("GGSCANNER_MINING_WAYPOINT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let point = &route.positions[waypoint];
         let mut locator = MiniMapLocator::new().unwrap();
-        let position = locator
-            .locate(
-                &frame,
-                (point.x, point.y),
-                std::env::var("GGSCANNER_MINING_RADIUS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(60.0),
-                None,
-            )
-            .unwrap();
+        let position = locator.locate(
+            &frame,
+            (point.x, point.y),
+            std::env::var("GGSCANNER_MINING_RADIUS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60.0),
+            None,
+        );
+        if std::env::var_os("GGSCANNER_MINING_EXPECT_REJECTION").is_some() {
+            assert!(position.is_err(), "Unexpected location: {position:?}");
+            println!("Rejected mismatched landing: {}", position.unwrap_err());
+            return;
+        }
+        let position = position.unwrap();
         println!(
             "Landing position {position:?}; anchor ({},{})",
             point.x, point.y

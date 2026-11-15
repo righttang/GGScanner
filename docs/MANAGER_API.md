@@ -24,7 +24,7 @@ Routes must start at a teleport and use Teyvat surface coordinates. Supported
 movement is walk/run/dash, with path/target/orientation points and linnea_mining
 actions. Orientation points turn the camera without moving toward the target.
 Unsupported actions are reported with their waypoint number before admission.
-Initial in-game validation covers the community G09 and G11 surface routes.
+Initial in-game validation covers the community G09, G10 and G11 surface routes.
 Other compatible imports should be tested locally before a longer run.
 The active party must contain Linnea. The runtime recognizes and selects her
 existing party slot. Acquisition counts require readable game notifications.
