@@ -5,7 +5,7 @@ edition = "2021"
 description = "Genshin Impact item scanner"
 repository = "https://github.com/wormtql/yas"
 keywords = ["GenshinImpact", "artifacts", "scanner", "ocr"]
-license = "GPL-2.0-or-later"
+license = "GPL-3.0-or-later"
 
 [build-dependencies]
 time = "0.3"

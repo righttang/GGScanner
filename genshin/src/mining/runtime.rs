@@ -79,6 +79,16 @@ pub struct MiningReport {
     pub stopped: bool,
     #[serde(default)]
     pub map_floor: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<MiningRecovery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MiningRecovery {
+    pub outcome: String,
+    pub destination: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,7 +104,7 @@ pub struct MiningPointResult {
 
 pub type MiningProgress<'a> = dyn Fn(&MiningReport) + 'a;
 
-struct MovementProgress {
+pub(super) struct MovementProgress {
     anchor: (f64, f64),
     unchanged: usize,
     target: (f64, f64),
@@ -103,7 +113,7 @@ struct MovementProgress {
 }
 
 impl MovementProgress {
-    fn new(position: (f64, f64), target: (f64, f64)) -> Self {
+    pub(super) fn new(position: (f64, f64), target: (f64, f64)) -> Self {
         Self {
             anchor: position,
             unchanged: 0,
@@ -112,7 +122,7 @@ impl MovementProgress {
             not_closer: 0,
         }
     }
-    fn observe(&mut self, position: (f64, f64)) -> Result<()> {
+    pub(super) fn observe(&mut self, position: (f64, f64)) -> Result<()> {
         if (self.anchor.0 - position.0).hypot(self.anchor.1 - position.1) >= 1.0 {
             self.anchor = position;
             self.unchanged = 0;
@@ -198,6 +208,24 @@ mod windows {
         motion: MotionDetector,
         vehicle: bool,
         underwater_route: bool,
+        map_locator: super::super::big_map::MapLocator,
+        anchor_icons: super::super::big_map::AnchorIcons,
+        camera_calibration: Option<(f64, f64, Instant)>,
+        camera_probes: u64,
+        has_mavuika: Option<bool>,
+    }
+    impl KeyDriver for Game<'_> {
+        fn key_down(&mut self, key: Key) -> Result<()> {
+            self.check()?;
+            if matches!(key, Key::Layout('1'..='4')) {
+                self.selected_role = None;
+            }
+            self.ctrl.system_control.key_down(key)
+        }
+        fn key_up(&mut self, key: Key) -> Result<()> {
+            // Release even when cancelled or the foreground window has changed.
+            self.ctrl.system_control.key_up(key)
+        }
     }
     impl Drop for Game<'_> {
         fn drop(&mut self) {
@@ -256,20 +284,38 @@ mod windows {
         }
         fn key(&mut self, key: Key) -> Result<()> {
             self.check()?;
-            self.ctrl.system_control.key_press(key)
+            let hold = if matches!(key, Key::Layout('1'..='4')) {
+                150
+            } else {
+                60
+            };
+            yas::system_control::key_hold::with_held_key_control(self, key, |game| game.wait(hold))
         }
-        fn forward(&mut self, ms: u64, sprint: bool) -> Result<()> {
+        fn pause_world(&mut self) -> Result<()> {
             self.check()?;
-            self.ctrl.system_control.key_down(Key::Layout('w'))?;
-            let result = (|| {
-                if sprint {
-                    self.ctrl.system_control.key_down(Key::Shift)?;
-                }
-                self.wait(ms)
-            })();
-            let released = self.ctrl.system_control.key_up(Key::Layout('w'));
-            let sprint_released = self.ctrl.system_control.key_up(Key::Shift);
-            result.and(released).and(sprint_released)
+            self.key_up(Key::Layout('w'))?;
+            self.key_up(Key::Shift)?;
+            ensure!(
+                self.ctrl.is_likely_main_world(),
+                "Main world is unavailable for pausing"
+            );
+            self.key(Key::Escape)?;
+            self.wait(200)?;
+            ensure!(!self.ctrl.is_likely_main_world(), "Pause menu did not open");
+            Ok(())
+        }
+        fn resume_world(&mut self) -> Result<()> {
+            self.check()?;
+            if self.ctrl.is_likely_main_world() {
+                return Ok(());
+            }
+            self.key(Key::Escape)?;
+            self.wait(200)?;
+            ensure!(
+                self.ctrl.is_likely_main_world(),
+                "Pause menu did not return to the world"
+            );
+            Ok(())
         }
         fn frame(&self) -> Result<RgbImage> {
             self.check()?;
@@ -301,6 +347,34 @@ mod windows {
                 self.ctrl.scaler.scale_x(x).round() as u32,
                 self.ctrl.scaler.scale_y(y).round() as u32,
             )
+        }
+        fn set_map_zoom(&mut self, y: f64) -> Result<()> {
+            ensure!(
+                (490.0..=595.0).contains(&y),
+                "Map zoom target is outside the navigation range"
+            );
+            let frame = self.frame()?;
+            let (x, current_y) = self.map_locator.zoom_knob(&frame)?;
+            if (current_y - y).abs() < 3.0 {
+                return Ok(());
+            }
+            let origin = self.ctrl.game_info.window.origin();
+            let sx = origin.x + self.ctrl.scaler.scale_x(x).round() as i32;
+            let sy = origin.y + self.ctrl.scaler.scale_y(current_y).round() as i32;
+            self.ctrl.system_control.mouse_drag(
+                sx,
+                sy,
+                sx,
+                origin.y + self.ctrl.scaler.scale_y(y).round() as i32,
+            )?;
+            self.wait(400)?;
+            let after = self.frame()?;
+            let (_, actual) = self.map_locator.zoom_knob(&after)?;
+            ensure!(
+                (actual - y).abs() < 8.0,
+                "Map zoom slider did not reach its target"
+            );
+            Ok(())
         }
         fn rotate(&mut self, x: f64, y: f64) -> Result<()> {
             let mut remaining_x = x.round() as i32;
@@ -337,10 +411,34 @@ mod windows {
             );
             Ok(frame)
         }
-        fn select_role(&mut self, role: Role) -> Result<()> {
-            if self.selected_role == Some(role) {
+        fn select_slot(&mut self, slot: usize) -> Result<()> {
+            ensure!(slot < 4, "Party slot is outside the active party");
+            let before = self.frame()?;
+            if super::super::vision::active_party_slot(&before) == Some(slot) {
                 return Ok(());
             }
+            for _ in 0..3 {
+                self.key(Key::Layout(char::from(b'1' + slot as u8)))?;
+                // Include network acknowledgement and the shared switch CD.
+                self.wait(1500)?;
+                let after = self.frame()?;
+                if super::super::vision::active_party_slot(&after) == Some(slot) {
+                    return Ok(());
+                }
+                self.wait(250)?;
+            }
+            let after = self.frame()?;
+            if cfg!(debug_assertions) {
+                before.save("data/mining/last-party-switch-before.png").ok();
+                after.save("data/mining/last-party-switch-after.png").ok();
+            }
+            anyhow::bail!(
+                "Requested party slot {} did not become active (observed {:?})",
+                slot + 1,
+                super::super::vision::active_party_slot(&after)
+            );
+        }
+        fn select_role(&mut self, role: Role) -> Result<()> {
             let mut names = Vec::new();
             for _ in 0..3 {
                 self.wait(400)?;
@@ -349,9 +447,17 @@ mod windows {
                 for slot in 0..4 {
                     let name = self.read(&frame, 1640, 259 + slot * 92, 130, 28)?;
                     if role.matches(&name) {
-                        self.key(Key::Layout(char::from(b'1' + slot as u8)))?;
-                        self.wait(800)?;
+                        let active = super::super::vision::active_party_slot(&frame);
+                        if active == Some(slot as usize)
+                            || (active.is_none() && self.selected_role == Some(role))
+                        {
+                            self.selected_role = Some(role);
+                            return Ok(());
+                        }
+                        self.select_slot(slot as usize)
+                            .with_context(|| format!("Select role {}", role.name()))?;
                         self.selected_role = Some(role);
+                        self.camera_calibration = None;
                         return Ok(());
                     }
                     names.push(name);
@@ -363,6 +469,29 @@ mod windows {
                 "Active party needs {}. Observed names: {names:?}",
                 role.name()
             )
+        }
+        fn select_travel_role(&mut self) -> Result<()> {
+            if self.underwater_route {
+                return self.select_role(Role::Dehya);
+            }
+            if self.has_mavuika.is_none() {
+                let frame = self.frame()?;
+                let mut available = false;
+                for slot in 0..4 {
+                    available |= Role::Mavuika.matches(&self.read(
+                        &frame,
+                        1640,
+                        259 + slot * 92,
+                        130,
+                        28,
+                    )?);
+                }
+                self.has_mavuika = Some(available);
+            }
+            if self.has_mavuika == Some(true) {
+                self.select_role(Role::Mavuika)?;
+            }
+            Ok(())
         }
         fn confirm_vehicle(&mut self, expected: bool) -> Result<()> {
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -490,9 +619,6 @@ mod windows {
                     self.wait_skill(Role::Mavuika)?;
                 }
             }
-            if matches!(key, GameKey::Slot(_)) {
-                self.selected_role = None;
-            }
             self.key(key.native())?;
             if key == GameKey::Skill
                 && !self.underwater_route
@@ -529,10 +655,9 @@ mod windows {
                 }
             }
             if down {
-                self.check()?;
-                self.ctrl.system_control.key_down(key.native())
+                self.key_down(key.native())
             } else {
-                self.ctrl.system_control.key_up(key.native())
+                self.key_up(key.native())
             }
         }
         fn button_state(&mut self, button: Button, down: bool) -> Result<()> {
@@ -597,6 +722,11 @@ mod windows {
             motion: MotionDetector::new()?,
             vehicle: false,
             underwater_route: false,
+            map_locator: super::super::big_map::MapLocator::new(),
+            anchor_icons: super::super::big_map::AnchorIcons::new(),
+            camera_calibration: None,
+            camera_probes: 0,
+            has_mavuika: None,
         };
         game.check()?;
         if !game.ctrl.return_to_main_ui(3) {
@@ -719,6 +849,8 @@ mod windows {
                             position.context("Missing teleport position")?,
                             (point.x, point.y),
                             &point.move_mode,
+                            progress,
+                            report,
                         )?);
                         pickup_visible(&mut game, progress, report)?;
                     }
@@ -863,6 +995,31 @@ mod windows {
                     error
                 );
             }
+            if result.is_err() && game.check().is_ok() {
+                if let Err(error) = recover_if_needed(
+                    &mut game,
+                    &atlas,
+                    mini_locator,
+                    &teleports,
+                    progress,
+                    report,
+                ) {
+                    let paused = game.check().is_ok()
+                        && game.ctrl.return_to_main_ui(2)
+                        && game.pause_world().is_ok();
+                    report.recovery = Some(MiningRecovery {
+                        outcome: if paused { "paused" } else { "failed" }.into(),
+                        destination: if paused {
+                            "current"
+                        } else {
+                            "StarfellLakeStatue"
+                        }
+                        .into(),
+                        error: Some(format!("{error:#}")),
+                    });
+                    progress(report);
+                }
+            }
             result?;
         }
         Ok(())
@@ -884,16 +1041,43 @@ mod windows {
     }
 
     fn camera_heading(game: &mut Game<'_>) -> Result<(f64, f64)> {
+        if let Some((sensitivity, offset, at)) = game.camera_calibration {
+            if at.elapsed() < Duration::from_secs(15) {
+                if let Ok(angle) = super::super::vision::camera_cone_heading(&game.frame()?) {
+                    return Ok((angle + offset, sensitivity));
+                }
+            }
+            game.camera_calibration = None;
+        }
         // Camera rotation changes the mini-map's viewing cone, while terrain
         // stays still. Difference the two frames to remove terrain brightness.
+        game.key_up(Key::Layout('w'))?;
+        game.key_up(Key::Shift)?;
+        game.camera_probes += 1;
         let mut last_error = None;
         for pixels in [160.0, 320.0] {
             let before = game.frame()?;
             game.rotate(pixels, 0.0)?;
             let after = game.frame()?;
             game.rotate(-pixels, 0.0)?;
+            if cfg!(debug_assertions) && game.camera_probes == 1 {
+                before.save("data/mining/last-camera-probe-before.png").ok();
+                after.save("data/mining/last-camera-probe-after.png").ok();
+            }
             match super::super::vision::estimate_camera_rotation(&before, &after, pixels) {
-                Ok(heading) => return Ok(heading),
+                Ok(heading) => {
+                    if let (Ok(a), Ok(b)) = (
+                        super::super::vision::camera_cone_heading(&before),
+                        super::super::vision::camera_cone_heading(&after),
+                    ) {
+                        let measured = (pixels / heading.1).to_radians();
+                        if angle_difference(b, a + measured).abs() < 8.0_f64.to_radians() {
+                            game.camera_calibration =
+                                Some((heading.1, angle_difference(heading.0, a), Instant::now()));
+                        }
+                    }
+                    return Ok(heading);
+                },
                 Err(error) => {
                     if cfg!(debug_assertions) {
                         before.save("data/mining/last-camera-before.png").ok();
@@ -933,122 +1117,248 @@ mod windows {
         anyhow::bail!("Could not confirm camera orientation")
     }
 
+    struct Travel<'a, 'g, 'p> {
+        game: &'a mut Game<'g>,
+        mini: &'a mut MiniMapLocator,
+        sensitivity: f64,
+        started: Instant,
+        phase: Option<&'p mut dyn FnMut(&str)>,
+    }
+    impl KeyDriver for Travel<'_, '_, '_> {
+        fn key_down(&mut self, key: Key) -> Result<()> {
+            self.game.key_down(key)
+        }
+        fn key_up(&mut self, key: Key) -> Result<()> {
+            self.game.key_up(key)
+        }
+    }
+    impl super::super::travel::TravelDriver for Travel<'_, '_, '_> {
+        fn observe(
+            &mut self,
+            expected: (f64, f64),
+            pause: bool,
+        ) -> Result<super::super::travel::Observation> {
+            let began = Instant::now();
+            let mut paused = pause
+                || self
+                    .game
+                    .camera_calibration
+                    .is_none_or(|(_, _, at)| at.elapsed() >= Duration::from_secs(15));
+            if paused {
+                self.game.key_up(Key::Layout('w'))?;
+                self.game.key_up(Key::Shift)?;
+            }
+            let frame = self.game.frame()?;
+            ensure!(
+                super::super::vision::player_health_fraction(&frame).is_none_or(|hp| hp >= 0.30),
+                "Health too low for navigation"
+            );
+            let mut position = self
+                .mini
+                .locate(&frame, expected, 20.0, Some(self.game.token));
+            if position
+                .as_ref()
+                .map_or(true, |p| (p.0 - expected.0).hypot(p.1 - expected.1) > 24.0)
+            {
+                self.game.check()?;
+                self.game.key_up(Key::Layout('w'))?;
+                self.game.key_up(Key::Shift)?;
+                paused = true;
+                if let Some(update) = self.phase.as_mut() {
+                    update("relocalizing");
+                }
+                // Match the captured world image while Paimon's menu pauses
+                // combat. Expanded/global searches must not leave an idle
+                // character exposed for the duration of asset loading.
+                let recovery_frame = self.game.frame()?;
+                self.game.pause_world()?;
+                let recovered = self
+                    .mini
+                    .locate(&recovery_frame, expected, 60.0, Some(self.game.token))
+                    .or_else(|_| {
+                        self.mini
+                            .locate(&recovery_frame, expected, 250.0, Some(self.game.token))
+                    })
+                    .or_else(|_| self.mini.relocalize(&recovery_frame, Some(self.game.token)))?;
+                self.game.resume_world()?;
+                self.game.wait(100)?;
+                let confirmed = self.mini.locate(
+                    &self.game.frame()?,
+                    recovered,
+                    12.0,
+                    Some(self.game.token),
+                )?;
+                ensure!(
+                    (confirmed.0 - recovered.0).hypot(confirmed.1 - recovered.1) < 3.0,
+                    "Global mini-map recovery was not stable across fresh frames"
+                );
+                position = Ok(confirmed);
+                if let Some(update) = self.phase.as_mut() {
+                    update("moving");
+                }
+            }
+            if began.elapsed() > Duration::from_millis(250) {
+                self.game.key_up(Key::Layout('w'))?;
+                paused = true;
+            }
+            let probes_before = self.game.camera_probes;
+            let fast = self.game.camera_calibration.and_then(|(s, offset, at)| {
+                if at.elapsed() >= Duration::from_secs(15) {
+                    return None;
+                }
+                super::super::vision::camera_cone_heading(&frame)
+                    .ok()
+                    .map(|angle| (angle + offset, s))
+            });
+            let (heading, sensitivity) = match fast {
+                Some(value) => value,
+                None => camera_heading(self.game)?,
+            };
+            paused |= probes_before != self.game.camera_probes;
+            self.sensitivity = sensitivity;
+            let labels = format!(
+                "{} {}",
+                self.game.read(&frame, 1560, 1024, 100, 34)?,
+                self.game.read(&frame, 1660, 1024, 100, 34)?
+            );
+            let motion = self.game.motion.observe(&frame, &labels);
+            if began.elapsed() > Duration::from_millis(250) || paused {
+                self.game.key_up(Key::Layout('w'))?;
+                self.game.key_up(Key::Shift)?;
+                paused = true;
+            }
+            if cfg!(debug_assertions) {
+                if let Ok(bytes) = serde_json::to_vec(&serde_json::json!({
+                    "elapsedMs":self.started.elapsed().as_millis(),"position":position.as_ref().ok(),
+                    "headingDegrees":heading.to_degrees(),"motion":format!("{motion:?}"),"paused":paused,
+                })) {
+                    let _ = super::super::routes::write_cache(
+                        std::path::Path::new("data/mining/last-navigation.json"),
+                        &bytes,
+                    );
+                }
+            }
+            Ok(super::super::travel::Observation {
+                position: position?,
+                heading,
+                motion,
+                grounded: motion == Motion::Ground && self.game.motion.ground_skill_present(&frame),
+                paused,
+            })
+        }
+        fn turn(&mut self, radians: f64) -> Result<()> {
+            self.game
+                .rotate(radians.to_degrees() * self.sensitivity, 0.0)
+        }
+        fn wait(&mut self, ms: u64) -> Result<()> {
+            self.game.wait(ms)
+        }
+        fn time_ms(&self) -> u64 {
+            self.started.elapsed().as_millis() as u64
+        }
+    }
     fn move_to(
         game: &mut Game<'_>,
         mini_locator: &mut MiniMapLocator,
-        mut current: (f64, f64),
+        current: (f64, f64),
         target: (f64, f64),
         mode: &str,
+        progress: &MiningProgress<'_>,
+        report: &mut MiningReport,
     ) -> Result<(f64, f64)> {
-        let started = Instant::now();
-        let mut movement = MovementProgress::new(current, target);
-        let mut recovery_used = false;
-        let mut last_heading: Option<f64> = None;
-        let mut since_face = 0;
-        let mut glide_finished = false;
-        if mode == "fly" {
-            for _ in 0..8 {
-                if game.motion()? == Motion::Gliding {
-                    break;
-                }
-                game.key(Key::Space)?;
-                game.forward(180, false)?;
-                game.wait(150)?;
-            }
+        if !matches!(game.motion()?, Motion::Gliding | Motion::Climbing) {
+            game.select_travel_role()?;
+        }
+        let mut update = |phase: &str| {
+            report.phase = phase.into();
+            progress(report);
+        };
+        move_to_current(game, mini_locator, current, target, mode, Some(&mut update))
+    }
+    fn move_to_current(
+        game: &mut Game<'_>,
+        mini_locator: &mut MiniMapLocator,
+        current: (f64, f64),
+        target: (f64, f64),
+        mode: &str,
+        phase: Option<&mut dyn FnMut(&str)>,
+    ) -> Result<(f64, f64)> {
+        let mut driver = Travel {
+            game,
+            mini: mini_locator,
+            sensitivity: 1.0,
+            started: Instant::now(),
+            phase,
+        };
+        super::super::travel::follow(&mut driver, current, target, mode)
+            .with_context(|| format!("Target {target:?}; mode {mode}"))
+    }
+    fn recover_if_needed(
+        game: &mut Game<'_>,
+        atlas: &Atlas,
+        mini: &mut MiniMapLocator,
+        teleports: &TeleportCatalog,
+        progress: &MiningProgress<'_>,
+        report: &mut MiningReport,
+    ) -> Result<()> {
+        game.check()?;
+        game.key_up(Key::Layout('w'))?;
+        game.key_up(Key::Shift)?;
+        game.ctrl.system_control.left_button(false)?;
+        game.ctrl.system_control.middle_button(false)?;
+        game.leave_aim();
+        if !game.ctrl.return_to_main_ui(3) {
+            let frame = game.frame()?;
             ensure!(
-                game.motion()? == Motion::Gliding,
-                "Glider takeoff could not be confirmed"
+                game.read(&frame, 650, 395, 650, 100)?.contains("全部队员")
+                    && game.read(&frame, 820, 950, 300, 75)?.contains("复苏"),
+                "Recovery cannot enter the main world"
+            );
+            game.click(960.0, 985.0)?;
+            game.wait(5000)?;
+            ensure!(
+                game.ctrl.return_to_main_ui(3),
+                "Free revival did not return to the world"
             );
         }
-        loop {
-            let distance = (target.0 - current.0).hypot(target.1 - current.1);
-            let motion = game.motion()?;
-            if distance < 2.0 && (mode != "climb" || motion != Motion::Climbing) {
-                return Ok(current);
-            }
-            ensure!(
-                started.elapsed() < Duration::from_secs(120),
-                "Waypoint timed out"
-            );
-            let heading = (current.1 - target.1).atan2(current.0 - target.0);
-            if since_face >= 6
-                || last_heading.is_none_or(|last| angle_difference(heading, last).abs() > 0.12)
-            {
-                face(game, current, target)?;
-                last_heading = Some(heading);
-                since_face = 0;
-            }
-            since_face += 1;
-            if mode == "fly" && !glide_finished {
-                if motion == Motion::Ground
-                    && distance < 8.0
-                    && game.motion.ground_skill_present(&game.frame()?)
-                {
-                    glide_finished = true;
-                    yas::log_info!(
-                        "已在目标附近落地，改为步行接近",
-                        "Landed near target; finishing approach on foot"
-                    );
-                }
-                ensure!(
-                    glide_finished || motion == Motion::Gliding,
-                    "Gliding ended before the waypoint"
-                );
-            }
-            if mode == "jump" {
-                game.key(Key::Space)?;
-            }
-            game.forward(
-                if distance < 6.0 { 150 } else { 450 },
-                matches!(mode, "run" | "dash" | "swim") && distance > 20.0,
-            )?;
-            game.wait(100)?;
-            let next = locate(game, mini_locator, Some(current), 20)
-                .or_else(|_| locate(game, mini_locator, Some(current), 60))?;
-            ensure!(
-                (current.0 - next.0).hypot(current.1 - next.1) < 24.0,
-                "Mini-map position jumped unexpectedly"
-            );
-            // Climbing may change altitude without measurable map displacement.
-            // Its independent waypoint deadline still bounds the attempt.
-            if let Err(error) = if mode == "climb" && motion == Motion::Climbing {
-                Ok(())
-            } else {
-                movement.observe(next)
-            } {
-                if recovery_used {
-                    return Err(error)
-                        .with_context(|| format!("Target {target:?}; observed {next:?}"));
-                }
-                recovery_used = true;
-                if motion == Motion::Underwater {
-                    yas::log_info!(
-                        "水下行进受阻，尝试一次短距离上浮",
-                        "Underwater path blocked; attempting one short ascent"
-                    );
-                    actions::execute_script(game, "keydown(SPACE),w(0.6),keyup(SPACE)")?;
-                    game.wait(400)?;
-                } else {
-                    yas::log_info!(
-                        "挖矿行进受阻，尝试一次短跳脱困",
-                        "Mining path blocked; attempting one short jump"
-                    );
-                    game.key(Key::Space)?;
-                    game.forward(450, false)?;
-                    game.wait(900)?;
-                }
-                current = locate(game, mini_locator, Some(next), 20)
-                    .or_else(|_| locate(game, mini_locator, Some(next), 60))?;
-                ensure!(
-                    (current.0 - next.0).hypot(current.1 - next.1) < 24.0,
-                    "Mini-map position jumped unexpectedly during recovery"
-                );
-                movement = MovementProgress::new(current, target);
-                last_heading = None;
-                continue;
-            }
-            current = next;
+        let frame = game.frame()?;
+        let health = super::super::vision::player_health_fraction(&frame);
+        let airborne = matches!(game.motion()?, Motion::Gliding | Motion::Climbing);
+        if !super::super::vision::enemy_health_bar(&frame)
+            && health.is_none_or(|hp| hp >= 0.60)
+            && !airborne
+        {
+            return Ok(());
         }
+        report.phase = "recovering".into();
+        progress(report);
+        let statue = teleports.recovery_statue()?;
+        mini.set_floor(Some(0));
+        teleport(game, atlas, mini, statue.landing_position(), statue)?;
+        report.map_floor = mini.last_floor;
+        game.vehicle = false;
+        let position = locate(game, mini, Some(statue.landing_position()), 30)?;
+        move_to_current(game, mini, position, statue.map_position(), "walk", None)?;
+        land(game, "", progress, report)?;
+        report.phase = "recovering".into();
+        progress(report);
+        game.wait(10000)?;
+        for slot in 0..4 {
+            game.select_slot(slot)?;
+            let frame = game.frame()?;
+            ensure!(
+                super::super::vision::player_health_fraction(&frame).is_some_and(|hp| hp >= 0.97),
+                "Statue did not restore every party member"
+            );
+        }
+        game.selected_role = None;
+        report.recovery = Some(MiningRecovery {
+            outcome: "healed".into(),
+            destination: "StarfellLakeStatue".into(),
+            error: None,
+        });
+        progress(report);
+        Ok(())
     }
 
     fn teleport(
@@ -1058,9 +1368,47 @@ mod windows {
         target: (f64, f64),
         anchor: &TeleportAnchor,
     ) -> Result<()> {
+        let result = teleport_inner(game, atlas, mini_locator, target, anchor);
+        if result.is_err() && game.check().is_ok() {
+            // Own menu recovery instead of requiring the next route/test to
+            // close the failed map. return_to_main_ui verifies its destination.
+            game.ctrl.return_to_main_ui(3);
+        }
+        result
+    }
+
+    fn teleport_inner(
+        game: &mut Game<'_>,
+        atlas: &Atlas,
+        mini_locator: &mut MiniMapLocator,
+        target: (f64, f64),
+        anchor: &TeleportAnchor,
+    ) -> Result<()> {
+        use super::super::big_map::Projection;
+        game.camera_calibration = None;
         let map_target = anchor.map_position();
+        ensure!(
+            game.ctrl.return_to_main_ui(3),
+            "Could not open the map from the main world"
+        );
+        for key in [Key::Layout('w'), Key::Shift, Key::Space] {
+            game.ctrl.system_control.key_up(key)?;
+        }
+        if let Ok(position) = locate(game, mini_locator, Some(anchor.landing_position()), 20) {
+            let landing = anchor.landing_position();
+            if (position.0 - landing.0).hypot(position.1 - landing.1) < 12.0
+                && (position.0 - target.0).hypot(position.1 - target.1) < 16.0
+            {
+                return Ok(());
+            }
+        }
         game.key(Key::Layout('m'))?;
         game.wait(1000)?;
+        let map_frame = game.frame()?;
+        ensure!(
+            game.map_locator.is_open(&map_frame)?,
+            "World map did not open"
+        );
         if let Some(region) = [
             "蒙德",
             "璃月",
@@ -1088,32 +1436,70 @@ mod windows {
             game.click(x, y)?;
             game.wait(500)?;
         }
+        game.set_map_zoom(570.0)?;
         // Require several terrain features to agree on a north-up transform.
         let mut pan_trace = Vec::new();
-        let mut previous_map: Option<(f64, f64, f64)> = None;
-        let matcher =
-            super::super::features::FeatureAtlas::new(&atlas.image, map_target, Some(game.token))?;
+        let mut predicted: Option<Projection> = None;
+        let mut before_pan: Option<Projection> = None;
+        let mut recognition_failures = 0;
+        let mut zoom_recoveries = 0;
+        let mut click_retries = 0;
         let map_started = Instant::now();
         for _ in 0..40 {
             ensure!(
-                map_started.elapsed() < Duration::from_secs(120),
-                "Map navigation exceeded 120 seconds"
+                map_started.elapsed() < Duration::from_secs(180),
+                "Map navigation exceeded 180 seconds"
             );
             let frame = game.frame()?;
+            ensure!(
+                game.map_locator.is_open(&frame)?,
+                "World map closed during navigation"
+            );
             if cfg!(debug_assertions) {
                 frame.save("data/mining/last-map-before-match.png").ok();
             }
-            let patch = imageops::crop_imm(&frame, 660, 330, 600, 420).to_image();
-            let (x, y, scale) = matcher.locate(&patch, Some(game.token))?;
-            if let Some((px, py, ps)) = previous_map {
-                ensure!(
-                    (x - px).hypot(y - py) < 2000.0 && (scale - ps).abs() < 0.025,
-                    "Map projection changed unexpectedly after panning"
-                );
-            }
-            previous_map = Some((x, y, scale));
-            let screen_x = 960.0 + (x - map_target.0) * 0.25 / scale;
-            let screen_y = 540.0 + (y - map_target.1) * 0.25 / scale;
+            let hint = predicted.map(|p| p.center).unwrap_or(map_target);
+            let observation = game
+                .map_locator
+                .observe(&frame, atlas, hint, game.token)
+                .and_then(|p| {
+                    ensure!(
+                        predicted.is_none_or(|old| p.confirms_pan(old)
+                            && before_pan.is_none_or(|before| p.confirms_direction(before, old))),
+                        "Map projection disagrees with the sent drag"
+                    );
+                    Ok(p)
+                });
+            let projection = match observation {
+                Ok(p) => {
+                    recognition_failures = 0;
+                    p
+                },
+                Err(error) => {
+                    game.check()?;
+                    recognition_failures += 1;
+                    // No click is permitted on a predicted-only location.
+                    // Retry one fresh observation, then change zoom to expose
+                    // terrain at a different scale and perform global recovery.
+                    if recognition_failures < 2 {
+                        game.wait(300)?;
+                        continue;
+                    }
+                    ensure!(
+                        zoom_recoveries < 4,
+                        "Map localization failed after zoom recovery: {error:#}"
+                    );
+                    game.set_map_zoom([536.0, 570.0, 505.0, 590.0][zoom_recoveries])?;
+                    zoom_recoveries += 1;
+                    predicted = None;
+                    recognition_failures = 0;
+                    game.wait(400)?;
+                    continue;
+                },
+            };
+            let (x, y) = projection.center;
+            let scale = projection.scale;
+            let (screen_x, screen_y) = projection.screen(map_target);
             pan_trace.push(serde_json::json!({"center":[x,y],"scale":scale,"target":map_target,"screen":[screen_x,screen_y]}));
             if cfg!(debug_assertions) {
                 let _ = super::super::routes::write_cache(
@@ -1121,8 +1507,27 @@ mod windows {
                     &serde_json::to_vec_pretty(&pan_trace)?,
                 );
             }
-            if (120.0..1700.0).contains(&screen_x) && (150.0..900.0).contains(&screen_y) {
-                game.click(screen_x, screen_y)?;
+            if Projection::clickable((screen_x, screen_y)) {
+                let point =
+                    match game
+                        .anchor_icons
+                        .refine(&frame, anchor, (screen_x, screen_y), scale)
+                    {
+                        Ok(p) => p,
+                        Err(error) => {
+                            ensure!(
+                                click_retries < 3,
+                                "Teleport icon refinement failed: {error:#}"
+                            );
+                            click_retries += 1;
+                            // Restore a larger icon before trying to select it.
+                            game.click(48.0, 442.0)?;
+                            game.wait(400)?;
+                            predicted = None;
+                            continue;
+                        },
+                    };
+                game.click(point.0, point.1)?;
                 game.wait(600)?;
                 let mut panel = game.frame()?;
                 let mut label = game.read(&panel, 1650, 985, 190, 55)?;
@@ -1144,12 +1549,15 @@ mod windows {
                     "Teleport button absent; anchor may be locked or obscured"
                 );
                 game.click(1710.0, 1010.0)?;
-                game.wait(4000)?;
-                for _ in 0..20 {
+                game.wait(1500)?;
+                for _ in 0..60 {
                     if let Ok(landed) =
                         locate(game, mini_locator, Some(anchor.landing_position()), 50)
                     {
-                        if (landed.0 - target.0).hypot(landed.1 - target.1) <= 40.0 {
+                        let landing = anchor.landing_position();
+                        if (landed.0 - target.0).hypot(landed.1 - target.1) <= 40.0
+                            && (landed.0 - landing.0).hypot(landed.1 - landing.1) <= 16.0
+                        {
                             return Ok(());
                         }
                     }
@@ -1157,10 +1565,22 @@ mod windows {
                 }
                 anyhow::bail!("Teleport landing could not be confirmed");
             }
-            let dx = (960.0 - screen_x).clamp(-600.0, 600.0);
-            let dy = (540.0 - screen_y).clamp(-300.0, 300.0);
+            if (screen_x - 960.0).hypot(screen_y - 540.0) > 1600.0
+                && scale < 0.38
+                && zoom_recoveries < 4
+            {
+                game.click(48.0, 635.0)?;
+                game.wait(400)?;
+                predicted = None;
+                zoom_recoveries += 1;
+                continue;
+            }
             let origin = game.ctrl.game_info.window.origin();
             let (drag_x, drag_y) = super::super::vision::map_drag_origin(&frame);
+            let dx =
+                ((drag_x + (960.0 - screen_x).clamp(-600.0, 600.0)).clamp(380.0, 1680.0)) - drag_x;
+            let dy =
+                ((drag_y + (540.0 - screen_y).clamp(-300.0, 300.0)).clamp(150.0, 900.0)) - drag_y;
             let sx = game.ctrl.scaler.scale_x(drag_x) as i32 + origin.x;
             let sy = game.ctrl.scaler.scale_y(drag_y) as i32 + origin.y;
             game.ctrl.system_control.mouse_drag(
@@ -1169,6 +1589,11 @@ mod windows {
                 sx + game.ctrl.scaler.scale_x(dx) as i32,
                 sy + game.ctrl.scaler.scale_y(dy) as i32,
             )?;
+            before_pan = Some(projection);
+            predicted = Some(projection.panned((
+                game.ctrl.scaler.scale_x(dx) as i32 as f64 / game.ctrl.scaler.scale_x(1.0),
+                game.ctrl.scaler.scale_y(dy) as i32 as f64 / game.ctrl.scaler.scale_y(1.0),
+            )));
             game.wait(500)?;
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(&pan_trace) {
@@ -1188,7 +1613,11 @@ mod windows {
     ) -> Result<()> {
         report.phase = "landing".into();
         progress(report);
-        if game.motion()? == Motion::Gliding {
+        let motion = game.motion()?;
+        if motion == Motion::Climbing {
+            game.key(Key::Layout('x'))?;
+            game.wait(300)?;
+        } else if motion == Motion::Gliding {
             if !params.is_empty() {
                 game.key(Key::Space)?;
                 game.wait(params.parse::<u64>()?)?;
@@ -1202,7 +1631,10 @@ mod windows {
         while Instant::now() < deadline {
             game.wait(300)?;
             let frame = game.frame()?;
-            if game.motion()? == Motion::Ground && game.motion.ground_skill_present(&frame) {
+            if game.motion()? == Motion::Ground
+                && game.motion.ground_skill_present(&frame)
+                && super::super::vision::active_party_slot(&frame).is_some()
+            {
                 let since = grounded.get_or_insert_with(Instant::now);
                 if since.elapsed() >= Duration::from_millis(1500) {
                     return Ok(());
@@ -1231,7 +1663,12 @@ mod windows {
                 started.elapsed() < Duration::from_secs(90),
                 "Combat exceeded 90 seconds; enemy clearance unconfirmed"
             );
-            let enemy = super::super::vision::enemy_health_bar(&game.frame()?);
+            let frame = game.frame()?;
+            ensure!(
+                super::super::vision::player_health_fraction(&frame).is_some_and(|hp| hp >= 0.40),
+                "Health too low or unconfirmed for automatic combat"
+            );
+            let enemy = super::super::vision::enemy_health_bar(&frame);
             saw_enemy |= enemy;
             if enemy {
                 clear_since = None;

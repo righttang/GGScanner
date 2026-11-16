@@ -459,6 +459,8 @@ impl MiningUi {
             "breakingOre" => l.t("碎矿", "Breaking ore"),
             "pickingUp" => l.t("拾取矿物", "Collecting ore"),
             "landing" => l.t("确认着陆", "Confirming landing"),
+            "recovering" => l.t("返回神像恢复生命值", "Returning to a statue to recover"),
+            "relocalizing" => l.t("暂停并重新定位", "Paused while relocalizing"),
             "fighting" => l.t("清理附近敌人", "Clearing nearby enemies"),
             "searchingOre" => l.t("寻找矿石", "Searching for ore"),
             "aiming" => l.t("瞄准", "Aiming"),
@@ -469,6 +471,24 @@ impl MiningUi {
         };
         ui.heading(phase);
         ui.label(route_label(&report.route, l));
+        if let Some(recovery) = &report.recovery {
+            ui.label(if recovery.outcome == "healed" {
+                l.t(
+                    "已返回星落湖神像，队伍生命值已恢复",
+                    "Returned to the Starfell Lake statue and restored party health",
+                )
+            } else if recovery.outcome == "paused" {
+                l.t(
+                    "原地暂停，神像恢复未完成",
+                    "Paused in place; statue recovery did not complete",
+                )
+            } else {
+                l.t(
+                    "返回神像恢复生命值未完成",
+                    "Statue recovery did not complete",
+                )
+            });
+        }
         ui.label(format!(
             "{} / {}",
             report.completed_points, report.total_points

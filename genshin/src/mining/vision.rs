@@ -243,7 +243,7 @@ pub(super) fn big_map_scales() -> Vec<f64> {
     (10..=55).map(|n| n as f64 / 100.0).collect()
 }
 
-fn mini_map_overlay_mask(query: &RgbImage) -> GrayImage {
+pub(super) fn mini_map_overlay_mask(query: &RgbImage) -> GrayImage {
     let mut mask = GrayImage::new(query.width(), query.height());
     let is_marker = |pixel: &image::Rgb<u8>| {
         pixel.0.iter().all(|&channel| channel > 205)
@@ -478,6 +478,7 @@ pub(super) struct MiniMapLocator {
     scales: Vec<f64>,
     pub last_floor: Option<i32>,
     floor: Option<i32>,
+    last_layer: Option<String>,
 }
 
 fn confirms_mini_map_match(correlation: f64, displacement: f64, radius: f64) -> bool {
@@ -511,11 +512,13 @@ impl MiniMapLocator {
             scales: vec![1.60, 1.6333, 1.666667, 1.70, 1.7333],
             floor: None,
             last_floor: None,
+            last_layer: None,
         })
     }
     pub fn set_floor(&mut self, floor: Option<i32>) {
         self.floor = floor;
         self.last_floor = None;
+        self.last_layer = None;
     }
 
     pub fn locate(
@@ -525,6 +528,25 @@ impl MiniMapLocator {
         radius: f64,
         token: Option<&yas::cancel::CancelToken>,
     ) -> Result<(f64, f64)> {
+        self.locate_inner(frame, Some(expected), radius, token)
+    }
+
+    pub fn relocalize(
+        &mut self,
+        frame: &RgbImage,
+        token: Option<&yas::cancel::CancelToken>,
+    ) -> Result<(f64, f64)> {
+        self.locate_inner(frame, None, 0.0, token)
+    }
+
+    fn locate_inner(
+        &mut self,
+        frame: &RgbImage,
+        expected: Option<(f64, f64)>,
+        radius: f64,
+        token: Option<&yas::cancel::CancelToken>,
+    ) -> Result<(f64, f64)> {
+        let started = std::time::Instant::now();
         let mini = imageops::crop_imm(frame, 64, 20, 210, 210).to_image();
         let mut candidates: Vec<_> = self
             .layers
@@ -533,6 +555,9 @@ impl MiniMapLocator {
                 if self.floor.is_some_and(|floor| r.floor != floor) {
                     return false;
                 }
+                let Some(expected) = expected else {
+                    return true;
+                };
                 let dx = r.left - expected.0;
                 let dy = r.top - expected.1;
                 let extent = if r.scale > 1.0 { 900.0 } else { 8192.0 };
@@ -541,24 +566,44 @@ impl MiniMapLocator {
             .cloned()
             .collect();
         candidates.sort_by(|a, b| {
-            b.scale.total_cmp(&a.scale).then_with(|| {
-                (a.left - expected.0)
-                    .hypot(a.top - expected.1)
-                    .total_cmp(&(b.left - expected.0).hypot(b.top - expected.1))
-            })
+            (b.layer_id == self.last_layer.as_deref().unwrap_or(""))
+                .cmp(&(a.layer_id == self.last_layer.as_deref().unwrap_or("")))
+                .then_with(|| b.scale.total_cmp(&a.scale))
+                .then_with(|| {
+                    let expected = expected.unwrap_or((0.0, 0.0));
+                    (a.left - expected.0)
+                        .hypot(a.top - expected.1)
+                        .total_cmp(&(b.left - expected.0).hypot(b.top - expected.1))
+                })
         });
         let mut errors = Vec::new();
         let mut confirmed = Vec::new();
-        for layer in candidates.into_iter().take(16) {
+        for layer in candidates
+            .into_iter()
+            .take(if expected.is_some() { 16 } else { usize::MAX })
+        {
             ensure!(!token.is_some_and(|t| t.check_rmb()), "Mining stopped");
+            ensure!(
+                started.elapsed() < std::time::Duration::from_secs(120),
+                "Mini-map global recovery exceeded 120 seconds"
+            );
             if !self.loaded.contains_key(&layer.layer_id) {
                 let path = asset(&format!(
                     "BetterGI.Assets.Map/Assets/Map/Teyvat/{}_gray.webp",
                     layer.layer_id
                 ))?;
                 let image = image::open(path)?.to_luma8();
-                if self.loaded.len() >= 4 {
-                    self.loaded.clear();
+                if self.loaded.len() >= 8 {
+                    // Retain the most recent successful layer across recovery.
+                    let previous = self.last_layer.as_deref();
+                    if let Some(key) = self
+                        .loaded
+                        .keys()
+                        .find(|k| Some(k.as_str()) != previous)
+                        .cloned()
+                    {
+                        self.loaded.remove(&key);
+                    }
                 }
                 self.loaded.insert(
                     layer.layer_id.clone(),
@@ -573,24 +618,39 @@ impl MiniMapLocator {
             let atlas = &self.loaded[&layer.layer_id];
             let result = atlas.locate(
                 &mini,
-                Some(expected),
-                (radius * layer.scale) as i32,
+                expected,
+                if expected.is_some() {
+                    (radius * layer.scale) as i32
+                } else {
+                    atlas.image.width().max(atlas.image.height()) as i32
+                },
                 &self.scales,
                 true,
                 token,
             );
             match result {
                 Ok((x, y, _, correlation)) => {
-                    let displacement = (x - expected.0).hypot(y - expected.1);
+                    let displacement = expected
+                        .map(|p| (x - p.0).hypot(y - p.1))
+                        .unwrap_or(f64::INFINITY);
                     // A short walking pulse can retain a nearby position with
                     // weaker terrain contrast; teleports and wide recovery
                     // searches still need the stronger match.
-                    if confirms_mini_map_match(correlation, displacement, radius) {
-                        if self.floor.is_some() {
+                    if if expected.is_some() {
+                        confirms_mini_map_match(correlation, displacement, radius)
+                    } else {
+                        correlation >= 0.75
+                    } {
+                        if expected.is_some()
+                            && correlation >= 0.75
+                            && (self.floor.is_some()
+                                || self.last_layer.as_deref() == Some(&layer.layer_id))
+                        {
                             self.last_floor = Some(layer.floor);
+                            self.last_layer = Some(layer.layer_id);
                             return Ok((x, y));
                         }
-                        confirmed.push((correlation, x, y, layer.floor));
+                        confirmed.push((correlation, x, y, layer.floor, layer.layer_id.clone()));
                     }
                     errors.push(format!(
                         "{}: uncertain map match (correlation {correlation:.3}, displacement {displacement:.2})",
@@ -603,17 +663,143 @@ impl MiniMapLocator {
         confirmed.sort_by(|a, b| b.0.total_cmp(&a.0));
         if let Some(best) = confirmed.first() {
             ensure!(
-                !confirmed
-                    .iter()
-                    .skip(1)
-                    .any(|other| other.3 != best.3 && best.0 - other.0 < 0.04),
+                !confirmed.iter().skip(1).any(|other| (other.3 != best.3
+                    || (other.1 - best.1).hypot(other.2 - best.2) > 40.0)
+                    && best.0 - other.0 < 0.04),
                 "Mini-map floor is ambiguous; specify info.floor for this route"
             );
             self.last_floor = Some(best.3);
+            self.last_layer = Some(best.4.clone());
             return Ok((best.1, best.2));
         }
         anyhow::bail!("Map position or floor unconfirmed: {}", errors.join("; "))
     }
+}
+
+/// Angular camera-cone contrast. Terrain can also form a bright sector, so the
+/// executor only trusts this fast observation after a measured rotation has
+/// verified that the sector follows the camera in both direction and amount.
+pub(super) fn active_party_slot(frame: &RgbImage) -> Option<usize> {
+    // Static HUD chevron only; no character names or account pixels are stored.
+    const ARROW: [u32; 17] = [
+        0, 0x400, 0x600, 0x700, 0xFC0, 0xFE0, 0xFF0, 0x1FE0, 0xFC0, 0xF80, 0xF00, 0xE00, 0x800, 0,
+        0, 0, 0,
+    ];
+    let mut arrows: Vec<_> = (0..4)
+        .map(|slot| {
+            let mut intersection = 0;
+            let mut union = 0;
+            for (row, expected) in ARROW.into_iter().enumerate() {
+                let mut observed = 0;
+                for x in 0..18 {
+                    let p = frame.get_pixel(1736 + x, 269 + slot * 92 + row as u32).0;
+                    if *p.iter().min().unwrap() > 220 {
+                        observed |= 1 << x;
+                    }
+                }
+                intersection += (expected & observed).count_ones();
+                union += (expected | observed).count_ones();
+            }
+            (intersection as f64 / union.max(1) as f64, slot as usize)
+        })
+        .collect();
+    arrows.sort_by(|a, b| b.0.total_cmp(&a.0));
+    if arrows[0].0 >= 0.62 && arrows[0].0 - arrows[1].0 >= 0.15 {
+        return Some(arrows[0].1);
+    }
+    let mut values: Vec<_> = (0..4)
+        .map(|slot| {
+            let center = 277 + slot * 92;
+            let mut samples: Vec<_> = [(1861, center - 8), (1880, center + 8)]
+                .into_iter()
+                .flat_map(|(x, y)| {
+                    (y..y + 3).flat_map(move |yy| (x..x + 3).map(move |xx| (xx, yy)))
+                })
+                .map(|(x, y)| {
+                    frame
+                        .get_pixel(x, y)
+                        .0
+                        .iter()
+                        .map(|&v| v as u32)
+                        .sum::<u32>()
+                        / 3
+                })
+                .collect();
+            samples.sort_unstable();
+            (samples[samples.len() / 2], slot as usize)
+        })
+        .collect();
+    values.sort_unstable();
+    // The active numeric badge is grey; the other three are white. Require
+    // separation, rather than treating one dark scenery pixel as a selection.
+    (values[1].0 > values[0].0 + 30).then_some(values[0].1)
+}
+
+pub(super) fn player_health_fraction(frame: &RgbImage) -> Option<f64> {
+    let end = (810..1112)
+        .filter(|&x| {
+            (1008..1015)
+                .filter(|&y| {
+                    let p = frame.get_pixel(x, y).0;
+                    (p[1] > 200 && p[0] < 190 && p[2] < 80 && p[1].saturating_sub(p[0]) > 60)
+                        || (p[0] > 200 && p[1] < 120 && p[2] < 120)
+                })
+                .count()
+                >= 2
+        })
+        .last()?;
+    Some((end - 810 + 1) as f64 / 302.0)
+}
+
+pub(super) fn camera_cone_heading(frame: &RgbImage) -> Result<f64> {
+    if let Ok(heading) = super::camera::heading(frame) {
+        return Ok(heading);
+    }
+    let mut profile = [0.0; 360];
+    for (degree, value) in profile.iter_mut().enumerate() {
+        let angle = (degree as f64).to_radians();
+        let mut count = 0;
+        for radius in (28..76).step_by(2) {
+            let p = frame
+                .get_pixel(
+                    (168.0 + radius as f64 * angle.cos()).round() as u32,
+                    (125.0 + radius as f64 * angle.sin()).round() as u32,
+                )
+                .0;
+            if p.iter().all(|&v| v > 215) {
+                continue;
+            }
+            *value += (p[0] as f64 + p[1] as f64 + p[2] as f64) / 3.0;
+            count += 1;
+        }
+        if count > 0 {
+            *value /= count as f64;
+        }
+    }
+    let score = |heading: i32| {
+        let inside = (-44..=44)
+            .map(|d| profile[(heading + d).rem_euclid(360) as usize])
+            .sum::<f64>()
+            / 89.0;
+        let outside = (70..=290)
+            .map(|d| profile[(heading + d).rem_euclid(360) as usize])
+            .sum::<f64>()
+            / 221.0;
+        inside - outside
+    };
+    let (angle, best) = (0..360)
+        .map(|i| (i, score(i)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap();
+    let other = (0..360)
+        .filter(|&i| ((i - angle + 180).rem_euclid(360) - 180).abs() > 90)
+        .map(score)
+        .fold(f64::NEG_INFINITY, f64::max);
+    ensure!(
+        best > 4.0 && best - other > best * 0.25,
+        "Camera cone is ambiguous"
+    );
+    Ok((angle as f64).to_radians())
 }
 
 pub(super) fn estimate_camera_rotation(
@@ -669,6 +855,119 @@ pub(super) fn estimate_camera_rotation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn health_reads_fill_endpoint_through_text_and_low_health_red() {
+        for (length, color) in [
+            (302, [140, 240, 0]),
+            (151, [140, 240, 0]),
+            (60, [240, 50, 50]),
+        ] {
+            let mut frame = RgbImage::new(1920, 1080);
+            for x in 810..810 + length {
+                for y in 1008..1015 {
+                    frame.put_pixel(x, y, image::Rgb(color));
+                }
+            }
+            for x in 880..930 {
+                for y in 1009..1013 {
+                    frame.put_pixel(x, y, image::Rgb([255, 255, 255]));
+                }
+            }
+            assert!((player_health_fraction(&frame).unwrap() - length as f64 / 302.0).abs() < 0.01);
+        }
+        assert!(player_health_fraction(&RgbImage::new(1920, 1080)).is_none());
+    }
+    #[test]
+    fn global_mini_map_recovery_checks_all_floors_and_rejects_an_ambiguous_layer() {
+        let mini = RgbImage::from_fn(210, 210, |x, y| {
+            let v = (100.0
+                + 25.0 * (x as f64 / 13.0).sin()
+                + 25.0 * (y as f64 / 17.0).cos()
+                + 20.0 * ((x * y) as f64 / 1300.0).sin()) as u8;
+            image::Rgb([v, v, v])
+        });
+        let mut image = GrayImage::from_fn(1200, 1200, |x, y| {
+            image::Luma([((x * 37 + y * 97 + x * y) % 181) as u8])
+        });
+        imageops::replace(
+            &mut image,
+            &imageops::resize(&imageops::grayscale(&mini), 350, 350, FilterType::Triangle),
+            497,
+            497,
+        );
+        let mut frame = RgbImage::new(1920, 1080);
+        imageops::replace(&mut frame, &mini, 64, 20);
+        let layer = Layer {
+            layer_id: "synthetic".into(),
+            left: 1000.0,
+            top: 1000.0,
+            scale: 1.0,
+            floor: 0,
+        };
+        let mut locator = MiniMapLocator {
+            layers: vec![layer.clone()],
+            loaded: Default::default(),
+            scales: vec![1.666667],
+            last_floor: None,
+            floor: None,
+            last_layer: None,
+        };
+        locator.loaded.insert(
+            layer.layer_id.clone(),
+            Atlas {
+                image: image.clone(),
+                origin: (1000.0, 1000.0),
+                world_scale: 1.0,
+                minimum_correlation: 0.60,
+            },
+        );
+        let found = locator.relocalize(&frame, None).unwrap();
+        assert!((found.0 - 328.0).hypot(found.1 - 328.0) < 2.0, "{found:?}");
+        locator.layers.push(Layer {
+            layer_id: "other-floor".into(),
+            floor: -1,
+            ..layer
+        });
+        locator.loaded.insert(
+            "other-floor".into(),
+            Atlas {
+                image,
+                origin: (1000.0, 1000.0),
+                world_scale: 1.0,
+                minimum_correlation: 0.60,
+            },
+        );
+        assert!(locator.relocalize(&frame, None).is_err());
+        locator.set_floor(Some(-1));
+        assert!(locator.relocalize(&frame, None).is_ok());
+        assert_eq!(locator.last_floor, Some(-1));
+    }
+    #[test]
+    #[ignore = "requires a local measured camera probe"]
+    fn verifies_local_camera_cone_against_measured_rotation() {
+        let before = image::open(std::env::var("GGSCANNER_CAMERA_BEFORE").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let after = image::open(std::env::var("GGSCANNER_CAMERA_AFTER").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let (measured, sensitivity) = estimate_camera_rotation(&before, &after, 160.0).unwrap();
+        let a = super::super::camera::heading(&before).unwrap();
+        let b = super::super::camera::heading(&after).unwrap();
+        let error = |a: f64, b: f64| {
+            ((a - b + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
+                - std::f64::consts::PI)
+                .abs()
+        };
+        println!(
+            "Measured {}, cone {}/{}, sensitivity {sensitivity}",
+            measured.to_degrees(),
+            a.to_degrees(),
+            b.to_degrees()
+        );
+        assert!(error(a, measured) < 8.0_f64.to_radians());
+        assert!(error(b, a + (160.0 / sensitivity).to_radians()) < 8.0_f64.to_radians());
+    }
     #[test]
     #[ignore = "requires a local map region menu with additional header messages"]
     fn read_shifted_local_map_regions() {
@@ -831,8 +1130,40 @@ mod tests {
                     actual.to_degrees()
                 );
                 assert!((sensitivity - pixels / turn).abs() < 0.7);
+                let cone = camera_cone_heading(&scene(heading)).unwrap().to_degrees();
+                assert!(((cone - heading + 180.0).rem_euclid(360.0) - 180.0).abs() < 3.0);
             }
         }
+        assert!(
+            camera_cone_heading(&RgbImage::from_pixel(300, 240, image::Rgb([150, 150, 150])))
+                .is_err()
+        );
+    }
+    #[test]
+    #[ignore = "requires a local party HUD frame"]
+    fn verifies_local_active_party_badge() {
+        let frame = image::open(std::env::var("GGSCANNER_PARTY_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let expected = std::env::var("GGSCANNER_ACTIVE_SLOT")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(active_party_slot(&frame), Some(expected));
+    }
+    #[test]
+    #[ignore = "requires a local player health HUD frame"]
+    fn verifies_local_player_health() {
+        let frame = image::open(std::env::var("GGSCANNER_HEALTH_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let expected = std::env::var("GGSCANNER_HEALTH_FRACTION")
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        let actual = player_health_fraction(&frame).unwrap();
+        println!("Health fraction {actual}");
+        assert!((actual - expected).abs() < 0.035);
     }
     #[test]
     #[ignore = "requires a local landing frame and route"]

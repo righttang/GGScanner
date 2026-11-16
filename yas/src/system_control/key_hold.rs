@@ -7,6 +7,44 @@ pub trait KeyDriver {
     fn key_up(&mut self, key: Key) -> Result<()>;
 }
 
+/// A movement loop may stop and resume several keys. Arrange cleanup without
+/// issuing an initial press (pressing Shift merely to create a guard can dash).
+pub fn with_key_cleanup<D: KeyDriver, T>(
+    driver: &mut D,
+    keys: &[Key],
+    run: impl FnOnce(&mut D) -> Result<T>,
+) -> Result<T> {
+    struct Cleanup<'a, D: KeyDriver> {
+        driver: &'a mut D,
+        keys: &'a [Key],
+        released: bool,
+    }
+    impl<D: KeyDriver> Drop for Cleanup<'_, D> {
+        fn drop(&mut self) {
+            if !self.released {
+                for &key in self.keys {
+                    let _ = self.driver.key_up(key);
+                }
+            }
+        }
+    }
+    let mut guard = Cleanup {
+        driver,
+        keys,
+        released: false,
+    };
+    let result = run(guard.driver);
+    let mut release = Ok(());
+    for &key in guard.keys {
+        let r = guard.driver.key_up(key);
+        if release.is_ok() {
+            release = r;
+        }
+    }
+    guard.released = release.is_ok();
+    result.and_then(|value| release.map(|_| value))
+}
+
 pub fn with_held_key(
     driver: &mut impl KeyDriver,
     key: Key,
@@ -65,6 +103,26 @@ mod tests {
             self.releases += 1;
             Ok(())
         }
+    }
+    #[test]
+    fn cleanup_guard_does_not_press_keys_and_releases_after_unwinding() {
+        let mut driver = Driver::default();
+        let value = with_key_cleanup(&mut driver, &[Key::Layout('w'), Key::Shift], |driver| {
+            assert!(!driver.held);
+            driver.key_down(Key::Layout('w'))?;
+            Ok(42)
+        })
+        .unwrap();
+        assert_eq!(value, 42);
+        assert!(!driver.held);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = with_key_cleanup(&mut driver, &[Key::Layout('w')], |driver| {
+                driver.key_down(Key::Layout('w'))?;
+                panic!("movement unwound");
+            });
+        }))
+        .is_err());
+        assert!(!driver.held);
     }
     #[test]
     fn held_key_releases_after_success_error_and_partial_press() {

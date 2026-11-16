@@ -8,6 +8,112 @@ use yas::cancel::CancelToken;
 pub(super) struct FeatureAtlas {
     features: sift_features::SiftResult,
     origin: (u32, u32),
+    index: Vec<DescriptorNode>,
+}
+
+struct DescriptorNode {
+    feature: usize,
+    axis: usize,
+    children: [Option<usize>; 2],
+}
+
+// Best-bin-first descriptor search. Geometry still verifies every accepted
+// correspondence; approximate neighbours alone never establish a position.
+fn descriptor_index(features: &sift_features::SiftResult) -> Vec<DescriptorNode> {
+    fn build(
+        ids: &mut [usize],
+        f: &sift_features::SiftResult,
+        nodes: &mut Vec<DescriptorNode>,
+    ) -> Option<usize> {
+        if ids.is_empty() {
+            return None;
+        }
+        let axis = (0..128)
+            .max_by_key(|&axis| {
+                let sample: Vec<_> = ids
+                    .iter()
+                    .step_by((ids.len() / 32).max(1))
+                    .take(32)
+                    .map(|&i| f.descriptors[[i, axis]] as i64)
+                    .collect();
+                let n = sample.len() as i64;
+                n * sample.iter().map(|v| v * v).sum::<i64>() - sample.iter().sum::<i64>().pow(2)
+            })
+            .unwrap();
+        let mid = ids.len() / 2;
+        ids.select_nth_unstable_by_key(mid, |&i| f.descriptors[[i, axis]]);
+        let id = nodes.len();
+        nodes.push(DescriptorNode {
+            feature: ids[mid],
+            axis,
+            children: [None, None],
+        });
+        let (left, right) = ids.split_at_mut(mid);
+        let children = [build(left, f, nodes), build(&mut right[1..], f, nodes)];
+        nodes[id].children = children;
+        Some(id)
+    }
+    let mut nodes = Vec::with_capacity(features.keypoints.len());
+    build(
+        &mut (0..features.keypoints.len()).collect::<Vec<_>>(),
+        features,
+        &mut nodes,
+    );
+    nodes
+}
+
+fn nearest_descriptors(
+    query: &[u8],
+    f: &sift_features::SiftResult,
+    nodes: &[DescriptorNode],
+) -> [(u32, usize); 2] {
+    use std::{cmp::Reverse, collections::BinaryHeap};
+    let mut best = [(u32::MAX, usize::MAX); 2];
+    let mut visit = |i: usize| {
+        let mut distance = 0;
+        for (j, &q) in query.iter().enumerate() {
+            let d = q as i32 - f.descriptors[[i, j]] as i32;
+            distance += (d * d) as u32;
+            if distance >= best[1].0 {
+                return;
+            }
+        }
+        if distance < best[0].0 {
+            best[1] = best[0];
+            best[0] = (distance, i);
+        } else {
+            best[1] = (distance, i);
+        }
+    };
+    if nodes.is_empty() {
+        for i in 0..f.keypoints.len() {
+            visit(i);
+        }
+    } else {
+        let mut queue = BinaryHeap::from([Reverse((0u32, 0usize))]);
+        for _ in 0..8192 {
+            let Some(Reverse((bound, id))) = queue.pop() else {
+                break;
+            };
+            let node = &nodes[id];
+            visit(node.feature);
+            let delta = query[node.axis] as i32 - f.descriptors[[node.feature, node.axis]] as i32;
+            let near = usize::from(delta >= 0);
+            for side in 0..2 {
+                if let Some(child) = node.children[side] {
+                    queue.push(Reverse((
+                        if side == near {
+                            bound
+                        } else {
+                            bound.max((delta * delta) as u32)
+                        },
+                        child,
+                    )));
+                }
+            }
+        }
+    }
+    best
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -114,6 +220,39 @@ fn consensus(pairs: &[Pair], cancel: Option<&CancelToken>) -> Result<Transform> 
 }
 
 impl FeatureAtlas {
+    /// Select neighbouring blocks from the pretrained bank. Reference terrain
+    /// descriptors are shared across teleports instead of recomputed on pans.
+    pub fn around(&self, target: (f64, f64)) -> Result<Self> {
+        let (cx, cy) = (4096.0 - target.0 * 0.25, 3072.0 - target.1 * 0.25);
+        let mut keypoints = Vec::new();
+        let mut descriptors = Vec::new();
+        for (i, p) in self.features.keypoints.iter().enumerate() {
+            let (x, y) = (
+                p.x as f64 + self.origin.0 as f64,
+                p.y as f64 + self.origin.1 as f64,
+            );
+            if (x - cx).abs() < 768.0 && (y - cy).abs() < 768.0 {
+                let mut point = p.clone();
+                point.x = x as f32;
+                point.y = y as f32;
+                keypoints.push(point);
+                descriptors.extend(self.features.descriptors.row(i).iter().copied());
+            }
+        }
+        ensure!(
+            keypoints.len() >= 10,
+            "Local pretrained map has too few features"
+        );
+        let descriptors = ndarray::Array2::from_shape_vec((keypoints.len(), 128), descriptors)?;
+        Ok(Self {
+            features: sift_features::SiftResult {
+                keypoints,
+                descriptors,
+            },
+            origin: (0, 0),
+            index: Vec::new(),
+        })
+    }
     pub fn new(
         image: &GrayImage,
         target: (f64, f64),
@@ -146,6 +285,53 @@ impl FeatureAtlas {
         Ok(Self {
             features,
             origin: (x, y),
+            index: Vec::new(),
+        })
+    }
+
+    /// Pinned OpenCV SIFT assets are shared with BetterGI. KeyPoint records are
+    /// 28-byte little-endian structs, descriptors are one 128-byte PNG row each.
+    /// Decode fields explicitly rather than relying on a Rust/native ABI.
+    pub fn global(cancel: Option<&CancelToken>) -> Result<Self> {
+        let prefix = "BetterGI.Assets.Map/Assets/Map/Teyvat/Teyvat_0_256_SIFT";
+        let points = std::fs::read(super::vision::asset(&format!("{prefix}.kp.bin"))?)?;
+        let descriptors =
+            image::open(super::vision::asset(&format!("{prefix}.mat.png"))?)?.to_luma8();
+        ensure!(
+            points.len() % 28 == 0
+                && descriptors.width() == 128
+                && descriptors.height() as usize == points.len() / 28,
+            "Map feature assets have inconsistent dimensions"
+        );
+        let mut keypoints = Vec::new();
+        for p in points.chunks_exact(28) {
+            let value = |i| f32::from_le_bytes(p[i..i + 4].try_into().unwrap());
+            ensure!(
+                (0..5).all(|i| value(i * 4).is_finite()),
+                "Invalid map feature coordinate"
+            );
+            keypoints.push(sift_features::KeyPoint {
+                x: value(0),
+                y: value(4),
+                size: value(8),
+                angle: value(12),
+                response: value(16),
+            });
+        }
+        ensure!(keypoints.len() >= 10, "Global map has too few features");
+        ensure!(!cancel.is_some_and(|t| t.check_rmb()), "Mining stopped");
+        let features = sift_features::SiftResult {
+            keypoints,
+            descriptors: ndarray::Array2::from_shape_vec(
+                (descriptors.height() as usize, 128),
+                descriptors.into_raw(),
+            )?,
+        };
+        let index = descriptor_index(&features);
+        Ok(Self {
+            features,
+            origin: (0, 0),
+            index,
         })
     }
     pub fn locate(
@@ -155,7 +341,7 @@ impl FeatureAtlas {
     ) -> Result<(f64, f64, f64)> {
         ensure!(!cancel.is_some_and(|t| t.check_rmb()), "Mining stopped");
         let center = (query.width() as f64 / 2.0, query.height() as f64 / 2.0);
-        let query = sift_features::sift(&imageops::grayscale(query), Some(2000));
+        let query = sift_features::sift(&imageops::grayscale(query), Some(6000));
         let mut matches: Vec<_> = query
             .descriptors
             .outer_iter()
@@ -166,25 +352,9 @@ impl FeatureAtlas {
                 if cancel.is_some_and(|t| t.is_cancelled()) {
                     return None;
                 }
-                let mut best = (u32::MAX, usize::MAX);
-                let mut second = u32::MAX;
-                for (j, r) in self.features.descriptors.outer_iter().enumerate() {
-                    let dist = d
-                        .iter()
-                        .zip(r.iter())
-                        .map(|(&a, &b)| {
-                            let v = a as i32 - b as i32;
-                            (v * v) as u32
-                        })
-                        .sum::<u32>();
-                    if dist < best.0 {
-                        second = best.0;
-                        best = (dist, j);
-                    } else if dist < second {
-                        second = dist;
-                    }
-                }
-                ((best.0 as u64) * 100 < (second as u64) * 49).then_some((best.0, *i, best.1))
+                let [best, second] =
+                    nearest_descriptors(d.as_slice().unwrap(), &self.features, &self.index);
+                ((best.0 as u64) * 100 < (second.0 as u64) * 49).then_some((best.0, *i, best.1))
             })
             .collect();
         matches.sort_unstable();

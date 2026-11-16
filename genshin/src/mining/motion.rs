@@ -121,8 +121,18 @@ impl MotionDetector {
 fn match_glyph(frame: &GrayImage, template: &GrayImage) -> f64 {
     find_glyph(frame, template).0
 }
-fn find_glyph(frame: &GrayImage, template: &GrayImage) -> (f64, u32, u32) {
+pub(super) fn find_glyph(frame: &GrayImage, template: &GrayImage) -> (f64, u32, u32) {
+    find_glyph_masked(frame, template, None)
+}
+pub(super) fn find_glyph_masked(
+    frame: &GrayImage,
+    template: &GrayImage,
+    mask: Option<&GrayImage>,
+) -> (f64, u32, u32) {
     if frame.width() < template.width() || frame.height() < template.height() {
+        return (0.0, 0, 0);
+    }
+    if mask.is_some_and(|m| m.dimensions() != frame.dimensions()) {
         return (0.0, 0, 0);
     }
     let n = (template.width() * template.height()) as f64;
@@ -136,13 +146,32 @@ fn find_glyph(frame: &GrayImage, template: &GrayImage) -> (f64, u32, u32) {
     for y in 0..=frame.height() - template.height() {
         for x in 0..=frame.width() - template.width() {
             let (mut sum, mut square, mut dot) = (0.0, 0.0, 0.0);
+            let (mut q_sum, mut q_square, mut count) = (0.0, 0.0, 0.0);
             for &(dx, dy, q) in &values {
+                if mask.is_some_and(|m| m.get_pixel(x + dx, y + dy)[0] != 0) {
+                    continue;
+                }
                 let p = frame.get_pixel(x + dx, y + dy)[0] as f64;
                 sum += p;
                 square += p * p;
                 dot += p * q;
+                if mask.is_some() {
+                    q_sum += q;
+                    q_square += q * q;
+                    count += 1.0;
+                }
             }
-            let score = dot / (norm * (square - sum * sum / n).max(0.01).sqrt()).max(0.01);
+            let score = if mask.is_some() {
+                if count < n * 0.70 {
+                    continue;
+                }
+                (dot - sum * q_sum / count)
+                    / ((square - sum * sum / count).max(0.01)
+                        * (q_square - q_sum * q_sum / count).max(0.01))
+                    .sqrt()
+            } else {
+                dot / (norm * (square - sum * sum / n).max(0.01).sqrt()).max(0.01)
+            };
             if score > best.0 {
                 best = (score, x, y);
             }
@@ -177,6 +206,25 @@ pub(super) fn save_crab_reference(frame: &RgbImage) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn masked_glyph_requires_visible_shape_and_rejects_complete_occlusion() {
+        let glyph = GrayImage::from_fn(9, 7, |x, y| {
+            image::Luma([if x == y || x + y == 8 { 20 } else { 230 }])
+        });
+        let mut frame = GrayImage::from_pixel(40, 30, image::Luma([80]));
+        imageops::replace(&mut frame, &glyph, 12, 9);
+        let mut mask = GrayImage::new(40, 30);
+        for y in 9..12 {
+            for x in 12..15 {
+                frame.put_pixel(x, y, image::Luma([255]));
+                mask.put_pixel(x, y, image::Luma([255]));
+            }
+        }
+        let (score, x, y) = find_glyph_masked(&frame, &glyph, Some(&mask));
+        assert!(score > 0.99 && (x, y) == (12, 9));
+        mask.fill(255);
+        assert!(find_glyph_masked(&frame, &glyph, Some(&mask)).0 < 0.1);
+    }
     #[test]
     fn vehicle_requires_shape_not_brightness() {
         assert!(!vehicle_active(&RgbImage::from_pixel(

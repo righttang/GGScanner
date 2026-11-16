@@ -16,8 +16,23 @@ pub(super) struct TeleportAnchor {
     position: [f64; 3],
     #[serde(rename = "tranPosition")]
     landing: Option<[f64; 3]>,
+    #[serde(skip)]
+    neighbor_distance: f64,
 }
 impl TeleportAnchor {
+    pub fn correction_limit(&self, scale: f64) -> f64 {
+        (self.neighbor_distance / (4.0 * scale) * 0.3).clamp(6.0, 36.0)
+    }
+    pub fn icon(&self) -> &str {
+        match self.kind.as_str() {
+            "Goddess" => "StatueOfTheSeven.png",
+            "SubSpaceWaypoint" => "SubSpaceWaypoint.png",
+            "PortableWaypoint" => "PortableWaypoint.png",
+            "NodKraiMeetingPoint" | "SnezhnayaMeetingPoint" => "NodKraiMeetingPoint.png",
+            "Domain" => "Domain.png",
+            _ => "TeleportWaypoint.png",
+        }
+    }
     pub fn map_position(&self) -> (f64, f64) {
         (self.position[2], self.position[0])
     }
@@ -37,6 +52,14 @@ impl TeleportAnchor {
 
 pub(super) struct TeleportCatalog(Vec<TeleportAnchor>);
 impl TeleportCatalog {
+    pub fn recovery_statue(&self) -> Result<&TeleportAnchor> {
+        let anchor = self.nearest((-82.18768, 3310.141))?;
+        ensure!(
+            anchor.kind == "Goddess",
+            "Recovery destination is not a statue"
+        );
+        Ok(anchor)
+    }
     pub fn new() -> Result<Self> {
         let file = format!("data/mining/teleports-{REVISION}.json");
         let path = Path::new(&file);
@@ -58,13 +81,25 @@ impl TeleportCatalog {
         }
         let data: Catalog =
             serde_json::from_slice(bytes.strip_prefix(&[239, 187, 191]).unwrap_or(bytes))?;
-        Ok(Self(
-            data.data
-                .into_iter()
-                .find(|scene| scene.name == "Teyvat")
-                .context("Teyvat teleport catalog is missing")?
-                .points,
-        ))
+        let mut points = data
+            .data
+            .into_iter()
+            .find(|scene| scene.name == "Teyvat")
+            .context("Teyvat teleport catalog is missing")?
+            .points;
+        for i in 0..points.len() {
+            let p = points[i].map_position();
+            points[i].neighbor_distance = points
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, a)| {
+                    let q = a.map_position();
+                    (p.0 - q.0).hypot(p.1 - q.1)
+                })
+                .fold(f64::INFINITY, f64::min);
+        }
+        Ok(Self(points))
     }
     pub fn nearest(&self, point: (f64, f64)) -> Result<&TeleportAnchor> {
         let distance = |anchor: &&TeleportAnchor| {
