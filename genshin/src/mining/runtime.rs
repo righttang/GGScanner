@@ -1820,7 +1820,16 @@ mod windows {
         pickup_visible(game, progress, report)?;
         if sweep {
             let deadline = Instant::now() + Duration::from_secs(20);
-            for script in ["w(0.2)", "s(0.4)", "w(0.2)", "a(0.2)", "d(0.4)", "a(0.2)"] {
+            let scripts: &[&str] = if game.underwater_route {
+                &["w(0.2)", "s(0.4)", "w(0.2)", "a(0.2)", "d(0.4)", "a(0.2)"]
+            } else {
+                // Blasted ore can land beyond the short cardinal sweep.
+                // Visit the four corners, then finish near the starting point.
+                &[
+                    "w(0.35)", "d(0.35)", "s(0.7)", "a(0.7)", "w(0.7)", "d(0.35)", "s(0.35)",
+                ]
+            };
+            for &script in scripts {
                 if Instant::now() >= deadline {
                     break;
                 }
