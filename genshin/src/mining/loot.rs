@@ -1,4 +1,6 @@
-//! Ore acquisition parsing and conservative de-duplication of the HUD feed.
+//! Ore acquisition parsing and de-duplication of the HUD feed.
+use anyhow::Result;
+use image::RgbImage;
 use std::collections::BTreeMap;
 
 pub const ORE_NAMES: &[&str] = &[
@@ -31,6 +33,22 @@ pub fn parse_line(text: &str) -> Option<(&'static str, usize)> {
     (1..=99).contains(&count).then_some((name, count))
 }
 
+pub(super) fn read_visible(
+    frame: &RgbImage,
+    mut read: impl FnMut(u32, u32, u32, u32) -> Result<String>,
+) -> Result<BTreeMap<String, usize>> {
+    let mut visible = BTreeMap::new();
+    // The aimed character can fill the right half of the old wide crop. Hair
+    // merges separate toast rows or is OCR'd as extra quantity digits. Keep
+    // only the icon/name/count columns and include the whole stacked feed.
+    for (top, height) in super::vision::text_rows(frame, 90, 300, 260, 600) {
+        if let Some((name, count)) = parse_line(&read(90, top, 260, height)?) {
+            *visible.entry(name.to_string()).or_default() += count;
+        }
+    }
+    Ok(visible)
+}
+
 #[derive(Default)]
 pub struct LootTracker {
     maximum: BTreeMap<String, usize>,
@@ -39,7 +57,7 @@ pub struct LootTracker {
 }
 impl LootTracker {
     /// Toasts can flicker during OCR. Require a sustained empty interval before
-    /// accepting a new notification of the same size. Counts are lower bounds.
+    /// accepting a new notification of the same size. Counts remain OCR estimates.
     pub fn observe(
         &mut self,
         now_ms: u64,
@@ -64,10 +82,20 @@ impl LootTracker {
         self.empty_since = None;
         self.last_nonempty = Some(now_ms);
         let mut gain = BTreeMap::new();
-        for (name, count) in visible {
+        for (name, &count) in &visible {
+            // A fading/obscured 白铁块 can lose its leading glyph and be
+            // read as 铁块. When that longer label is simultaneously losing
+            // count, do not introduce its suffix as newly acquired ore.
+            if self.maximum.iter().any(|(longer, &previous)| {
+                longer != name
+                    && longer.contains(name.as_str())
+                    && visible.get(longer).copied().unwrap_or(0) < previous
+            }) {
+                continue;
+            }
             let previous = self.maximum.entry(name.clone()).or_default();
             if count > *previous {
-                gain.insert(name, count - *previous);
+                gain.insert(name.clone(), count - *previous);
                 *previous = count;
             }
         }
@@ -102,5 +130,48 @@ mod tests {
         tracker.observe(2600, BTreeMap::new());
         assert_eq!(tracker.observe(2800, feed(1)), feed(1));
         assert_eq!(tracker.observe(12000, feed(1)), feed(1));
+    }
+    #[test]
+    fn fading_long_labels_do_not_invent_suffix_ore_but_fresh_mixed_loot_counts() {
+        let fresh = BTreeMap::from([("白铁块".into(), 2), ("虹滴晶".into(), 3)]);
+        let faded = BTreeMap::from([
+            ("白铁块".into(), 1),
+            ("虹滴晶".into(), 2),
+            ("铁块".into(), 1),
+        ]);
+        let mut tracker = LootTracker::default();
+        assert_eq!(tracker.observe(0, fresh.clone()), fresh);
+        assert!(tracker.observe(400, faded).is_empty());
+        tracker.observe(1000, BTreeMap::new());
+        tracker.observe(2600, BTreeMap::new());
+        let mixed = BTreeMap::from([("白铁块".into(), 1), ("铁块".into(), 1)]);
+        assert_eq!(tracker.observe(2800, mixed.clone()), mixed);
+    }
+    #[test]
+    #[ignore = "requires a local acquisition feed frame and OCR model"]
+    fn reads_local_stacked_feed_without_aimed_character_pixels() {
+        let frame = image::open(std::env::var("GGSCANNER_MINING_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let ocr = crate::scanner::common::ocr_factory::create_ocr_model("ppocrv4").unwrap();
+        let actual = read_visible(&frame, |x, y, w, h| {
+            ocr.image_to_text(
+                &image::imageops::crop_imm(&frame, x, y, w, h).to_image(),
+                false,
+            )
+        })
+        .unwrap();
+        let expected: BTreeMap<String, usize> =
+            serde_json::from_str(&std::env::var("GGSCANNER_EXPECTED_LOOT").unwrap()).unwrap();
+        println!("Acquisition feed: {actual:?}");
+        if std::env::var_os("GGSCANNER_LOOT_ALLOW_FADE").is_some() {
+            // Replay the fading frame after the fully visible notification.
+            // Partial glyphs must not add newly acquired ore to the report.
+            let mut tracker = LootTracker::default();
+            tracker.observe(0, expected);
+            assert!(tracker.observe(400, actual).is_empty());
+        } else {
+            assert_eq!(actual, expected);
+        }
     }
 }

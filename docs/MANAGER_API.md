@@ -34,6 +34,11 @@ not edit party presets or equipment. Ground mining includes cooldown waits,
 ore-labelled F prompts and a bounded nearby pickup sweep. OCR loot estimates
 can miss or duplicate notifications; use inventory comparisons for exact quantities.
 A shot, skill cast or completed walk without acquisition is `unconfirmed`.
+After a route failure, `recovery.outcome` distinguishes `ready` (ground HUD,
+living party and sufficient active HP confirmed), `healed` (all four members
+verified restored at the statue), and `paused`/`failed`. A batch controller may
+advance to a separate route after `ready` or `healed`; the failed route remains
+failed. Unknown recovery state, cancellation or lost focus requires inspection.
 
 Navigation supports walk/run/dash/jump, climbing, glider takeoff, `stop_flying`
 (plunge and landing HUD checks), and underwater horizontal movement with typed

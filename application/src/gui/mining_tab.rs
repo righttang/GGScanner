@@ -477,6 +477,11 @@ impl MiningUi {
                     "已返回星落湖神像，队伍生命值已恢复",
                     "Returned to the Starfell Lake statue and restored party health",
                 )
+            } else if recovery.outcome == "ready" {
+                l.t(
+                    "已确认角色在地面且队员存活，本路线未完成",
+                    "Party confirmed alive on the ground; this route remains incomplete",
+                )
             } else if recovery.outcome == "paused" {
                 l.t(
                     "原地暂停，神像恢复未完成",

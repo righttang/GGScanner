@@ -676,6 +676,32 @@ impl MiniMapLocator {
     }
 }
 
+pub(super) fn sidebar_health_bars(frame: &RgbImage) -> [bool; 4] {
+    if frame.width() < 1920 || frame.height() < 1080 {
+        return [false; 4];
+    }
+    std::array::from_fn(|slot| {
+        let slot = slot as u32;
+        (286 + slot * 92..296 + slot * 92)
+            .filter(|&y| {
+                let mut run = 0;
+                let mut longest = 0;
+                for x in 1685..1768 {
+                    let [r, g, b] = frame.get_pixel(x, y).0;
+                    if g > 190 && (95..=185).contains(&r) && b < 80 && g.saturating_sub(r) > 35 {
+                        run += 1;
+                        longest = longest.max(run);
+                    } else {
+                        run = 0;
+                    }
+                }
+                longest >= 20
+            })
+            .count()
+            >= 2
+    })
+}
+
 pub(super) fn active_party_slot(frame: &RgbImage) -> Option<usize> {
     if frame.width() < 1920 || frame.height() < 1080 || player_health_fraction(frame).is_none() {
         return None;
@@ -684,28 +710,7 @@ pub(super) fn active_party_slot(frame: &RgbImage) -> Option<usize> {
     // HDR can wash the white active chevron and grey keycap into the scenery.
     // Require all three other bars, never infer an active member from a single
     // missing bar when another member may be dead or the HUD is hidden.
-    let bars: Vec<_> = (0..4)
-        .map(|slot| {
-            (286 + slot * 92..296 + slot * 92)
-                .filter(|&y| {
-                    let mut run = 0;
-                    let mut longest = 0;
-                    for x in 1685..1768 {
-                        let [r, g, b] = frame.get_pixel(x, y).0;
-                        if g > 190 && (95..=185).contains(&r) && b < 80 && g.saturating_sub(r) > 35
-                        {
-                            run += 1;
-                            longest = longest.max(run);
-                        } else {
-                            run = 0;
-                        }
-                    }
-                    longest >= 20
-                })
-                .count()
-                >= 2
-        })
-        .collect();
+    let bars = sidebar_health_bars(frame);
     if bars.iter().filter(|&&present| present).count() == 3 {
         return bars.iter().position(|&present| !present);
     }
@@ -762,6 +767,19 @@ pub(super) fn active_party_slot(frame: &RgbImage) -> Option<usize> {
     // The active numeric badge is grey; the other three are white. Require
     // separation, rather than treating one dark scenery pixel as a selection.
     (values[1].0 > values[0].0 + 30).then_some(values[0].1)
+}
+
+pub(super) fn party_ready_for_next_route(frame: &RgbImage, grounded: bool) -> bool {
+    grounded
+        && frame.width() >= 1920
+        && frame.height() >= 1080
+        && player_health_fraction(frame).is_some_and(|hp| hp >= 0.60)
+        && sidebar_health_bars(frame)
+            .iter()
+            .filter(|&&bar| bar)
+            .count()
+            == 3
+        && !enemy_health_bar(frame)
 }
 
 pub(super) fn player_health_fraction(frame: &RgbImage) -> Option<f64> {
@@ -1201,6 +1219,17 @@ mod tests {
                         active_party_slot(&sample),
                         (visible == 3).then_some(active as usize)
                     );
+                    assert_eq!(party_ready_for_next_route(&sample, true), visible == 3);
+                    assert!(!party_ready_for_next_route(&sample, false));
+                    if visible == 3 {
+                        let mut enemy = sample.clone();
+                        for x in 800..950 {
+                            for y in 300..307 {
+                                enemy.put_pixel(x, y, image::Rgb([250, 70, 90]));
+                            }
+                        }
+                        assert!(!party_ready_for_next_route(&enemy, true));
+                    }
                     for x in 810..1112 {
                         for y in 1008..1015 {
                             sample.put_pixel(x, y, image::Rgb([255, 255, 255]));
@@ -1211,10 +1240,21 @@ mod tests {
                         None,
                         "World HP must also be visible"
                     );
+                    assert!(!party_ready_for_next_route(&sample, true));
+                    for x in 810..960 {
+                        for y in 1008..1015 {
+                            sample.put_pixel(x, y, image::Rgb([143, 255, 0]));
+                        }
+                    }
+                    assert!(
+                        !party_ready_for_next_route(&sample, true),
+                        "Low HP cannot continue"
+                    );
                 }
             }
         }
         assert_eq!(active_party_slot(&RgbImage::new(100, 100)), None);
+        assert!(!party_ready_for_next_route(&RgbImage::new(100, 100), true));
     }
     #[test]
     #[ignore = "requires a local party HUD frame"]

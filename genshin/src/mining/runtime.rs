@@ -513,13 +513,8 @@ mod windows {
             })
         }
         fn record_loot(&mut self, frame: &RgbImage, report: &mut MiningReport) -> Result<bool> {
-            let mut visible = std::collections::BTreeMap::new();
-            for (top, height) in super::super::vision::text_rows(frame, 140, 370, 360, 340) {
-                let text = self.read(frame, 140, top, 360, height)?;
-                if let Some((name, count)) = super::super::loot::parse_line(&text) {
-                    *visible.entry(name.to_string()).or_default() += count;
-                }
-            }
+            let visible =
+                super::super::loot::read_visible(frame, |x, y, w, h| self.read(frame, x, y, w, h))?;
             let gain = self
                 .loot_tracker
                 .observe(self.started.elapsed().as_millis() as u64, visible);
@@ -1325,12 +1320,14 @@ mod windows {
             );
         }
         let frame = game.frame()?;
-        let health = super::super::vision::player_health_fraction(&frame);
-        let airborne = matches!(game.motion()?, Motion::Gliding | Motion::Climbing);
-        if !super::super::vision::enemy_health_bar(&frame)
-            && health.is_none_or(|hp| hp >= 0.60)
-            && !airborne
-        {
+        let motion = game.motion()?;
+        if super::super::vision::party_ready_for_next_route(&frame, motion == Motion::Ground) {
+            report.recovery = Some(MiningRecovery {
+                outcome: "ready".into(),
+                destination: "current".into(),
+                error: None,
+            });
+            progress(report);
             return Ok(());
         }
         report.phase = "recovering".into();
@@ -1340,21 +1337,34 @@ mod windows {
         teleport(game, atlas, mini, statue.landing_position(), statue)?;
         report.map_floor = mini.last_floor;
         game.vehicle = false;
+        game.wait(10000)?;
+        // Statue healing can already be complete at the confirmed teleport
+        // landing. Do not risk another localization/approach when all four
+        // members can be verified restored here.
+        if matches!(party_restored(game), Ok(true)) {
+            report.recovery = Some(MiningRecovery {
+                outcome: "healed".into(),
+                destination: "StarfellLakeStatue".into(),
+                error: None,
+            });
+            progress(report);
+            return Ok(());
+        }
+        game.check()?;
+        ensure!(
+            game.ctrl.return_to_main_ui(3),
+            "Recovery cannot resume the world"
+        );
         let position = locate(game, mini, Some(statue.landing_position()), 30)?;
         move_to_current(game, mini, position, statue.map_position(), "walk", None)?;
         land(game, "", progress, report)?;
         report.phase = "recovering".into();
         progress(report);
         game.wait(10000)?;
-        for slot in 0..4 {
-            game.select_slot(slot)?;
-            let frame = game.frame()?;
-            ensure!(
-                super::super::vision::player_health_fraction(&frame).is_some_and(|hp| hp >= 0.97),
-                "Statue did not restore every party member"
-            );
-        }
-        game.selected_role = None;
+        ensure!(
+            party_restored(game)?,
+            "Statue did not restore every party member"
+        );
         report.recovery = Some(MiningRecovery {
             outcome: "healed".into(),
             destination: "StarfellLakeStatue".into(),
@@ -1362,6 +1372,19 @@ mod windows {
         });
         progress(report);
         Ok(())
+    }
+
+    fn party_restored(game: &mut Game<'_>) -> Result<bool> {
+        for slot in 0..4 {
+            game.select_slot(slot)?;
+            if !super::super::vision::player_health_fraction(&game.frame()?)
+                .is_some_and(|hp| hp >= 0.97)
+            {
+                return Ok(false);
+            }
+        }
+        game.selected_role = None;
+        Ok(true)
     }
 
     fn teleport(
