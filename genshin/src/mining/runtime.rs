@@ -213,6 +213,7 @@ mod windows {
         camera_calibration: Option<(f64, f64, Instant)>,
         camera_probes: u64,
         has_mavuika: Option<bool>,
+        navigation_trace: std::collections::VecDeque<serde_json::Value>,
     }
     impl KeyDriver for Game<'_> {
         fn key_down(&mut self, key: Key) -> Result<()> {
@@ -720,6 +721,7 @@ mod windows {
             camera_calibration: None,
             camera_probes: 0,
             has_mavuika: None,
+            navigation_trace: Default::default(),
         };
         game.check()?;
         if !game.ctrl.return_to_main_ui(3) {
@@ -782,12 +784,8 @@ mod windows {
         let mut position = None;
         for (route, route_id) in routes.into_iter().zip(&request.route_ids) {
             report.route = route.info.name.clone();
-            mini_locator.set_floor(
-                route
-                    .info
-                    .floor
-                    .or_else(|| (route.environment() == "ground").then_some(0)),
-            );
+            game.navigation_trace.clear();
+            mini_locator.set_floor(route.floor_hint());
             let completed_before = report.completed_points;
             let loot_before = report.loot.clone();
             let result = (|| -> Result<()> {
@@ -817,19 +815,22 @@ mod windows {
                     .into();
                     progress(report);
                     if point.kind == "teleport" || point.action == "force_tp" {
+                        let anchor = teleports.route_anchor((point.x, point.y))?;
+                        let landing = anchor.landing_position();
                         teleport(
                             &mut game,
                             &atlas,
                             mini_locator,
-                            (point.x, point.y),
-                            teleports.nearest((point.x, point.y))?,
+                            landing,
+                            anchor,
+                            point.action == "force_tp",
                         )?;
                         game.selected_role = None;
-                        position = Some(locate(&game, mini_locator, Some((point.x, point.y)), 50)?);
+                        position = Some(locate(&game, mini_locator, Some(landing), 50)?);
                         report.map_floor = mini_locator.last_floor;
                         let landed = position.unwrap();
                         ensure!(
-                            (landed.0 - point.x).hypot(landed.1 - point.y) <= 40.0,
+                            (landed.0 - landing.0).hypot(landed.1 - landing.1) <= 16.0,
                             "Teleport landing does not match the requested anchor"
                         );
                     } else if point.kind == "orientation" {
@@ -994,6 +995,17 @@ mod windows {
                 if let Ok(frame) = game.frame() {
                     frame.save("data/mining/last-route-failure.png").ok();
                 }
+                if let Ok(bytes) = serde_json::to_vec_pretty(&serde_json::json!({
+                    "engineRevision":super::super::routes::ENGINE_REVISION,
+                    "route":report.route,"waypoint":report.waypoint,
+                    "error":result.as_ref().err().map(|error| format!("{error:#}")),
+                    "lastNavigation":game.navigation_trace,
+                })) {
+                    let _ = super::super::routes::write_cache(
+                        std::path::Path::new("data/mining/last-route-failure.json"),
+                        &bytes,
+                    );
+                }
                 if let Err(error) = recover_if_needed(
                     &mut game,
                     &atlas,
@@ -1121,6 +1133,8 @@ mod windows {
         sensitivity: f64,
         started: Instant,
         phase: Option<&'p mut dyn FnMut(&str)>,
+        target: (f64, f64),
+        mode: String,
     }
     impl KeyDriver for Travel<'_, '_, '_> {
         fn key_down(&mut self, key: Key) -> Result<()> {
@@ -1225,11 +1239,17 @@ mod windows {
                 self.game.key_up(Key::Shift)?;
                 paused = true;
             }
+            let navigation = serde_json::json!({
+                "elapsedMs":self.started.elapsed().as_millis(),"position":position.as_ref().ok(),
+                "headingDegrees":heading.to_degrees(),"motion":format!("{motion:?}"),"paused":paused,
+                "target":self.target,"mode":self.mode,
+            });
+            self.game.navigation_trace.push_back(navigation.clone());
+            if self.game.navigation_trace.len() > 64 {
+                self.game.navigation_trace.pop_front();
+            }
             if cfg!(debug_assertions) {
-                if let Ok(bytes) = serde_json::to_vec(&serde_json::json!({
-                    "elapsedMs":self.started.elapsed().as_millis(),"position":position.as_ref().ok(),
-                    "headingDegrees":heading.to_degrees(),"motion":format!("{motion:?}"),"paused":paused,
-                })) {
+                if let Ok(bytes) = serde_json::to_vec(&navigation) {
                     let _ = super::super::routes::write_cache(
                         std::path::Path::new("data/mining/last-navigation.json"),
                         &bytes,
@@ -1281,12 +1301,15 @@ mod windows {
         mode: &str,
         phase: Option<&mut dyn FnMut(&str)>,
     ) -> Result<(f64, f64)> {
+        game.navigation_trace.clear();
         let mut driver = Travel {
             game,
             mini: mini_locator,
             sensitivity: 1.0,
             started: Instant::now(),
             phase,
+            target,
+            mode: mode.into(),
         };
         super::super::travel::follow(&mut driver, current, target, mode)
             .with_context(|| format!("Target {target:?}; mode {mode}"))
@@ -1334,7 +1357,7 @@ mod windows {
         progress(report);
         let statue = teleports.recovery_statue()?;
         mini.set_floor(Some(0));
-        teleport(game, atlas, mini, statue.landing_position(), statue)?;
+        teleport(game, atlas, mini, statue.landing_position(), statue, false)?;
         report.map_floor = mini.last_floor;
         game.vehicle = false;
         game.wait(10000)?;
@@ -1393,8 +1416,9 @@ mod windows {
         mini_locator: &mut MiniMapLocator,
         target: (f64, f64),
         anchor: &TeleportAnchor,
+        force: bool,
     ) -> Result<()> {
-        let result = teleport_inner(game, atlas, mini_locator, target, anchor);
+        let result = teleport_inner(game, atlas, mini_locator, target, anchor, force);
         if result.is_err() && game.check().is_ok() {
             // Own menu recovery instead of requiring the next route/test to
             // close the failed map. return_to_main_ui verifies its destination.
@@ -1409,6 +1433,7 @@ mod windows {
         mini_locator: &mut MiniMapLocator,
         target: (f64, f64),
         anchor: &TeleportAnchor,
+        force: bool,
     ) -> Result<()> {
         use super::super::big_map::Projection;
         game.camera_calibration = None;
@@ -1422,7 +1447,8 @@ mod windows {
         }
         if let Ok(position) = locate(game, mini_locator, Some(anchor.landing_position()), 20) {
             let landing = anchor.landing_position();
-            if (position.0 - landing.0).hypot(position.1 - landing.1) < 12.0
+            if !force
+                && (position.0 - landing.0).hypot(position.1 - landing.1) < 12.0
                 && (position.0 - target.0).hypot(position.1 - target.1) < 16.0
             {
                 return Ok(());

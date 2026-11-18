@@ -662,12 +662,27 @@ impl MiniMapLocator {
         }
         confirmed.sort_by(|a, b| b.0.total_cmp(&a.0));
         if let Some(best) = confirmed.first() {
-            ensure!(
-                !confirmed.iter().skip(1).any(|other| (other.3 != best.3
-                    || (other.1 - best.1).hypot(other.2 - best.2) > 40.0)
-                    && best.0 - other.0 < 0.04),
-                "Mini-map floor is ambiguous; specify info.floor for this route"
-            );
+            let ambiguous = confirmed.iter().skip(1).any(|other| {
+                (other.3 != best.3 || (other.1 - best.1).hypot(other.2 - best.2) > 40.0)
+                    && best.0 - other.0 < 0.04
+            });
+            if ambiguous {
+                frame.save("data/mining/last-mini-map-ambiguous.png").ok();
+                if let Ok(bytes) = serde_json::to_vec_pretty(&serde_json::json!({
+                    "requestedFloor":self.floor,"expected":expected,"radius":radius,
+                    "candidates":confirmed,
+                })) {
+                    let _ = write_cache(
+                        std::path::Path::new("data/mining/last-mini-map-ambiguous.json"),
+                        &bytes,
+                    );
+                }
+                anyhow::bail!(
+                    "Mini-map position or floor is ambiguous (requested {:?}; candidates {:?})",
+                    self.floor,
+                    confirmed.iter().take(3).collect::<Vec<_>>()
+                );
+            }
             self.last_floor = Some(best.3);
             self.last_layer = Some(best.4.clone());
             return Ok((best.1, best.2));
@@ -1298,6 +1313,7 @@ mod tests {
             .unwrap_or(0);
         let point = &route.positions[waypoint];
         let mut locator = MiniMapLocator::new().unwrap();
+        locator.set_floor(route.floor_hint());
         let position = locator.locate(
             &frame,
             (point.x, point.y),
@@ -1307,12 +1323,22 @@ mod tests {
                 .unwrap_or(60.0),
             None,
         );
+        if std::env::var_os("GGSCANNER_MINING_PROBE_ONLY").is_some() {
+            println!(
+                "Mini-map diagnostic: {position:?}; floor {:?}; layer {:?}",
+                locator.last_floor, locator.last_layer
+            );
+            return;
+        }
         if std::env::var_os("GGSCANNER_MINING_EXPECT_REJECTION").is_some() {
             assert!(position.is_err(), "Unexpected location: {position:?}");
             println!("Rejected mismatched landing: {}", position.unwrap_err());
             return;
         }
         let position = position.unwrap();
+        if let Ok(floor) = std::env::var("GGSCANNER_MINING_EXPECT_FLOOR") {
+            assert_eq!(locator.last_floor, Some(floor.parse::<i32>().unwrap()));
+        }
         println!(
             "Landing position {position:?}; anchor ({},{})",
             point.x, point.y

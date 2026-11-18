@@ -47,9 +47,16 @@ The big map requires agreeing SIFT features and a north-up geometric transform.
 Region labels are located across overlapping rows to accommodate extra menu
 header messages. Start a route from the world view; after a failed task, inspect
 and close any remaining menus before retrying.
+Route teleport coordinates select a nearby known anchor; the runtime checks
+that anchor's canonical icon, menu and landing rather than treating the recorded
+sample as the exact spawn. `force_tp` also teleports when already near the anchor.
+Failures preserve one local `last-route-failure.png` and JSON with the latest
+64 navigation observations for diagnosis.
 Mini-map tracking uses local terrain templates. Layer manifests include caves;
-optional `info.floor` disambiguates overlapping floors. An ambiguous floor
+optional `info.floor` disambiguates overlapping floors. An ambiguous position or floor
 stops the route. `mapFloor` reports the most recently confirmed floor.
+Ground movement does not imply floor 0: unpinned routes can follow visually
+confirmed layers into caves; explicit floor metadata remains a constraint.
 
 For Fontaine underwater routes, run the matching A00 acquisition route first.
 After visually confirming the borrowed **armored crab** icon, save it through

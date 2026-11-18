@@ -79,6 +79,11 @@ impl Waypoint {
 }
 
 impl Route {
+    pub fn floor_hint(&self) -> Option<i32> {
+        // Ground describes the movement environment, not map elevation: a
+        // walking route can enter a cave. Only explicit metadata pins a floor.
+        self.info.floor
+    }
     pub fn environment(&self) -> &str {
         if !self.info.environment.is_empty() {
             return &self.info.environment;
@@ -243,7 +248,7 @@ pub struct RouteEntry {
     pub last_run: Option<RouteValidation>,
 }
 
-pub const ENGINE_REVISION: &str = "mining-20261119-v4";
+pub const ENGINE_REVISION: &str = "mining-20261119-v5";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteValidation {
@@ -577,6 +582,16 @@ pub(crate) fn write_cache(path: &Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ground_routes_do_not_implicitly_exclude_cave_floors() {
+        let mut route = Route::parse(br#"{"info":{"name":"ground route"},"positions":[{"id":1,"x":1,"y":1,"type":"teleport","move_mode":"walk"}]}"#).unwrap();
+        assert_eq!(route.environment(), "ground");
+        assert_eq!(route.floor_hint(), None);
+        route.info.floor = Some(-1);
+        assert_eq!(route.floor_hint(), Some(-1));
+        route.info.floor = Some(0);
+        assert_eq!(route.floor_hint(), Some(0));
+    }
     #[test]
     fn edited_routes_invalidate_previous_live_evidence() {
         let root =
