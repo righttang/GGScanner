@@ -22,16 +22,17 @@ inside the application. Route execution does not require GGArtifact or BetterGI.
   routes once in order. HTTP 202 returns `{"jobId":"..."}`; competing tasks get 409.
 - `{"routeIds":[],"stationary":true,"strategy":"zhongli"}` tests the current
   deposit. `strategy` accepts `auto`, `linnea`, `zhongli`, `claymore`. Auto uses
-  Mavuika's ordinary claymore attacks for generic `mining` points; explicitly
+  Linnea for generic ground `mining` points; explicitly
   named scripts and `linnea_mining` preserve their required role.
-  Stationary `auto` uses Linnea on land and the verified borrowed crab skill
+  Underwater route points use the verified borrowed crab skill regardless of
+  the ground strategy. Stationary `auto` uses Linnea on land and that crab skill
   underwater. Other stationary strategies reject an underwater HUD.
 
 The fixed role set is Linnea, Zhongli, Mavuika and Dehya. Bring the roles required
 by the selected routes; the runtime reads their existing party slots. It does
 not edit party presets or equipment. Ground mining includes cooldown waits,
-ore-labelled F prompts and a bounded nearby pickup sweep. Loot notifications
-are conservative lower bounds; use inventory comparisons for exact quantities.
+ore-labelled F prompts and a bounded nearby pickup sweep. OCR loot estimates
+can miss or duplicate notifications; use inventory comparisons for exact quantities.
 A shot, skill cast or completed walk without acquisition is `unconfirmed`.
 
 Navigation supports walk/run/dash/jump, climbing, glider takeoff, `stop_flying`

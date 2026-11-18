@@ -676,10 +676,39 @@ impl MiniMapLocator {
     }
 }
 
-/// Angular camera-cone contrast. Terrain can also form a bright sector, so the
-/// executor only trusts this fast observation after a measured rotation has
-/// verified that the sector follows the camera in both direction and amount.
 pub(super) fn active_party_slot(frame: &RgbImage) -> Option<usize> {
+    if frame.width() < 1920 || frame.height() < 1080 || player_health_fraction(frame).is_none() {
+        return None;
+    }
+    // Only the three inactive, living members have a sidebar health bar.
+    // HDR can wash the white active chevron and grey keycap into the scenery.
+    // Require all three other bars, never infer an active member from a single
+    // missing bar when another member may be dead or the HUD is hidden.
+    let bars: Vec<_> = (0..4)
+        .map(|slot| {
+            (286 + slot * 92..296 + slot * 92)
+                .filter(|&y| {
+                    let mut run = 0;
+                    let mut longest = 0;
+                    for x in 1685..1768 {
+                        let [r, g, b] = frame.get_pixel(x, y).0;
+                        if g > 190 && (95..=185).contains(&r) && b < 80 && g.saturating_sub(r) > 35
+                        {
+                            run += 1;
+                            longest = longest.max(run);
+                        } else {
+                            run = 0;
+                        }
+                    }
+                    longest >= 20
+                })
+                .count()
+                >= 2
+        })
+        .collect();
+    if bars.iter().filter(|&&present| present).count() == 3 {
+        return bars.iter().position(|&present| !present);
+    }
     // Static HUD chevron only; no character names or account pixels are stored.
     const ARROW: [u32; 17] = [
         0, 0x400, 0x600, 0x700, 0xFC0, 0xFE0, 0xFF0, 0x1FE0, 0xFC0, 0xF80, 0xF00, 0xE00, 0x800, 0,
@@ -1138,6 +1167,54 @@ mod tests {
             camera_cone_heading(&RgbImage::from_pixel(300, 240, image::Rgb([150, 150, 150])))
                 .is_err()
         );
+    }
+    #[test]
+    fn active_party_remains_confirmable_when_hdr_washes_out_white_markers() {
+        for color in [image::Rgb([143, 255, 0]), image::Rgb([150, 215, 50])] {
+            for active in 0..4 {
+                let mut frame = RgbImage::from_pixel(1920, 1080, image::Rgb([255, 255, 255]));
+                for x in 810..1112 {
+                    for y in 1008..1015 {
+                        frame.put_pixel(x, y, image::Rgb([143, 255, 0]));
+                    }
+                }
+                // More than one missing bar is ambiguous (for example a dead
+                // member); all four visible bars are not an active-party cue.
+                for visible in 0..=4 {
+                    let inactive: Vec<_> = (0..4).filter(|&slot| slot != active).collect();
+                    let mut sample = frame.clone();
+                    for &slot in inactive.iter().take(visible) {
+                        for y in 288 + slot * 92..293 + slot * 92 {
+                            for x in 1692..1762 {
+                                sample.put_pixel(x, y, color);
+                            }
+                        }
+                    }
+                    if visible == 4 {
+                        for y in 288 + active * 92..293 + active * 92 {
+                            for x in 1692..1762 {
+                                sample.put_pixel(x, y, color);
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        active_party_slot(&sample),
+                        (visible == 3).then_some(active as usize)
+                    );
+                    for x in 810..1112 {
+                        for y in 1008..1015 {
+                            sample.put_pixel(x, y, image::Rgb([255, 255, 255]));
+                        }
+                    }
+                    assert_eq!(
+                        active_party_slot(&sample),
+                        None,
+                        "World HP must also be visible"
+                    );
+                }
+            }
+        }
+        assert_eq!(active_party_slot(&RgbImage::new(100, 100)), None);
     }
     #[test]
     #[ignore = "requires a local party HUD frame"]

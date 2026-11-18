@@ -32,7 +32,7 @@ Skill 后可读 [在线规范](https://github.com/righttang/GGScanner/blob/main/
 - 开始前确认处于游戏主界面。传送失败后 Scanner 会尝试恢复世界界面；重试前仍须观察现场，未恢复时先关闭残留菜单。
 - 导航或战斗报错后，存在敌人、血量偏低或仍在空中时会尝试返回星落湖神像，逐人核验生命值；结果查看 `recovery`。恢复失败时尽可能原地暂停。用户停止或失去游戏焦点后不会继续传送。
 - `issues` 为空只表示指令已适配。查看 `lastRun` 区分走完且有收获提示、走完但收获未确认、失败和停止；路线或引擎版本变化后旧记录失效。
-- 通用采矿 `strategy` 可用 `auto`、`linnea`、`zhongli`、`claymore`；auto 的通用碎矿使用玛薇卡普通大剑攻击。固定队伍为玛薇卡、迪希雅、莉奈娅、钟离，路线写明角色时仍按路线执行。
+- 通用采矿 `strategy` 可用 `auto`、`linnea`、`zhongli`、`claymore`；auto 的通用地面采矿使用莉奈娅，水下路线使用已校验的螃蟹技能。固定队伍为玛薇卡、迪希雅、莉奈娅、钟离，路线写明角色时仍按路线执行；钟离护盾和明确指定的大剑策略保留。
 - 水下先跑对应 A00 学习技能路线。观察确认已借到重甲蟹技能后，用 `{"routeIds":[],"stationary":true,"calibrateCrab":true}` 保存本机图标参照，再运行采矿路线。参照只用于识别，不能授予技能；错误技能会停止，不在水下轮转地面护盾。
 - 水下原地试采用 `{"routeIds":[],"stationary":true,"strategy":"auto"}`；自动模式使用已校验的螃蟹技能，其他原地策略在水下会被拒绝。
 - 重叠地层不明确时停止；本地路线可用 `info.floor` 指定楼层。旧日之海、远古圣山、龙附身和额外角色脚本仍列出限制，不宣称所有社区路线都能完成。
@@ -40,7 +40,7 @@ Skill 后可读 [在线规范](https://github.com/righttang/GGScanner/blob/main/
   不自动重发开始请求。右键也可停止；焦点丢失会结束任务。
 - 检查每个矿点的 `outcome`、`shots`、`loot` 和 `error`。射箭不等于收获，
   `unconfirmed` 表示未读到收获提示，`noOre` 表示未识别到矿石。需要精确总量时，
-  对比背包前后数量；提示识别可能漏读。最新报告保存在 `data/mining/last-report.json`。
+  对比背包前后数量；提示识别可能漏读或重复计数。最新报告保存在 `data/mining/last-report.json`。
 
 客户端命令 `mining-routes`、`mining-refresh`、`mining-download`、`mining-import`
 对应路线库；`mine request.json` 提交任务。普通玩家无需操作网页。

@@ -448,9 +448,7 @@ mod windows {
                     let name = self.read(&frame, 1640, 259 + slot * 92, 130, 28)?;
                     if role.matches(&name) {
                         let active = super::super::vision::active_party_slot(&frame);
-                        if active == Some(slot as usize)
-                            || (active.is_none() && self.selected_role == Some(role))
-                        {
+                        if active == Some(slot as usize) {
                             self.selected_role = Some(role);
                             return Ok(());
                         }
@@ -996,6 +994,11 @@ mod windows {
                 );
             }
             if result.is_err() && game.check().is_ok() {
+                // Recovery moves away from the failed waypoint. Keep one
+                // local frame of the obstacle/HUD before that evidence is lost.
+                if let Ok(frame) = game.frame() {
+                    frame.save("data/mining/last-route-failure.png").ok();
+                }
                 if let Err(error) = recover_if_needed(
                     &mut game,
                     &atlas,
@@ -1875,13 +1878,13 @@ mod windows {
         progress: &MiningProgress<'_>,
         report: &mut MiningReport,
     ) -> Result<()> {
-        if matches!(strategy, MiningStrategy::Linnea) {
-            return mine(game, detector, 1, 24, progress, report);
-        }
         let initial_loot = report.loot.values().sum::<usize>();
         if game.underwater_route {
             game.press(GameKey::Skill)?;
             return finish_ground_mine(game, "armoredCrab", sweep, initial_loot, progress, report);
+        }
+        if matches!(strategy, MiningStrategy::Auto | MiningStrategy::Linnea) {
+            return mine(game, detector, 1, 24, progress, report);
         }
         report.phase = "breakingOre".into();
         progress(report);
