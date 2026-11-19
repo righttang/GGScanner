@@ -106,6 +106,10 @@ impl MotionDetector {
         if labels.to_ascii_lowercase().contains("ctrl")
             || labels.contains("下潜")
             || labels.contains("下沉")
+            // Underwater E has a different footer position from ground E/Q.
+            // Its matched key glyph survives unreadable Ctrl OCR. Actual crab
+            // identity is still checked separately before skill input.
+            || self.borrowed_skill_present(frame)
         {
             Motion::Underwater
         } else if space && cancel {
@@ -245,6 +249,10 @@ mod tests {
             .unwrap()
             .to_rgb8();
         let detector = MotionDetector::new().unwrap();
+        if let Ok(expected) = std::env::var("GGSCANNER_EXPECT_MOTION") {
+            assert_eq!(format!("{:?}", detector.observe(&frame, "")), expected);
+            return;
+        }
         assert_eq!(
             detector.observe(&frame, "") == Motion::Ground && detector.ground_skill_present(&frame),
             std::env::var("GGSCANNER_EXPECT_GROUND").unwrap() == "true"

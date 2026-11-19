@@ -72,6 +72,8 @@ For Fontaine underwater routes, run the matching A00 acquisition route first.
 After visually confirming the borrowed **armored crab** icon, save it through
 `{"routeIds":[],"stationary":true,"calibrateCrab":true}` or the Mining tab's
 calibration button. This learns a local HUD reference, not the ability itself.
+After returning to a ground statue for recovery, reacquire the underwater skill
+before advancing to another underwater route; the saved reference cannot restore it.
 Subsequent underwater E actions require an underwater HUD and a matching icon.
 Wrong/missing skills stop execution. SeaOfBygoneEras and AncientSacredMountain
 maps, saurian possession and scripts naming other characters remain unsupported.
