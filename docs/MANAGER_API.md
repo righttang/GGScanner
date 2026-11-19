@@ -44,6 +44,8 @@ failed. Unknown recovery state, cancellation or lost focus requires inspection.
 Slot changes require a confirmed world HUD and a visible living target; an
 unavailable target stops input rather than opening or confirming a food revival
 dialog. Switch acknowledgements are polled, with health checks while blocked.
+Transient HUD fades are observed without sending another slot key; a stable
+visible target is required again before a retry.
 Navigation and ore aiming stop at low or unconfirmed active HP, and navigation
 also stops if a different party member becomes active unexpectedly. Ground
 mining checks for enemies again after reaching the deposit.

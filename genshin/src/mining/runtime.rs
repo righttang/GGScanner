@@ -441,7 +441,20 @@ mod windows {
                 return Ok(());
             }
             for _ in 0..3 {
-                let before = self.frame()?;
+                let mut before = self.frame()?;
+                let ready_by = Instant::now() + Duration::from_secs(1);
+                while !super::super::vision::party_slot_available(&before, slot)
+                    && Instant::now() < ready_by
+                {
+                    // A previous switch can still be fading its HUD. Observe
+                    // until it settles; do not send a key on an unknown frame.
+                    self.wait(100)?;
+                    before = self.frame()?;
+                }
+                if super::super::vision::active_party_slot(&before) == Some(slot) {
+                    self.selected_slot = Some(slot);
+                    return Ok(());
+                }
                 ensure!(
                     super::super::vision::party_slot_available(&before, slot),
                     "Party slot {} is defeated, too low on health or its HUD is unconfirmed",
@@ -465,16 +478,16 @@ mod windows {
                         continue;
                     }
                     confirmed = false;
-                    ensure!(
-                        super::super::vision::party_slot_available(&after, slot),
-                        "Party switch became unavailable; no further slot keys will be sent"
-                    );
-                    let hp = super::super::vision::player_health_fraction(&after).unwrap();
-                    ensure!(
-                        hp >= initial_hp - 0.15
-                            && (!super::super::vision::enemy_health_bar(&after) || hp >= 0.45),
-                        "Health fell while party switching was blocked"
-                    );
+                    // The actual switch animation briefly hides the HP bars.
+                    // It is neither acknowledgement nor permission for another
+                    // key. The next attempt repeats the living-target preflight.
+                    if let Some(hp) = super::super::vision::player_health_fraction(&after) {
+                        ensure!(
+                            hp >= initial_hp - 0.15
+                                && (!super::super::vision::enemy_health_bar(&after) || hp >= 0.45),
+                            "Health fell while party switching was blocked"
+                        );
+                    }
                 }
                 self.wait(250)?;
             }
