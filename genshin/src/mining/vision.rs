@@ -487,6 +487,19 @@ struct Layer {
     floor: i32,
 }
 
+fn deduplicate_layers(layers: &mut Vec<Layer>) {
+    let mut seen = std::collections::HashSet::new();
+    layers.retain(|layer| {
+        seen.insert((
+            layer.layer_id.clone(),
+            layer.floor,
+            layer.left.to_bits(),
+            layer.top.to_bits(),
+            layer.scale.to_bits(),
+        ))
+    });
+}
+
 /// City mini-maps use their own projection and magnification. Match those
 /// templates before the surrounding overworld, preserving world coordinates.
 pub(super) struct MiniMapLocator {
@@ -523,6 +536,9 @@ impl MiniMapLocator {
             let records: Vec<Layer> = serde_json::from_slice(&std::fs::read(path)?)?;
             layers.extend(records);
         }
+        // Manifests overlap across asset versions. Exact repeats must not use
+        // the local candidate budget and hide distinct surface/floor maps.
+        deduplicate_layers(&mut layers);
         Ok(Self {
             layers,
             loaded: Default::default(),
@@ -944,6 +960,37 @@ pub(super) fn estimate_camera_rotation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repeated_layer_manifests_do_not_hide_surface_candidates_or_other_floors() {
+        let underground = Layer {
+            layer_id: "cave".into(),
+            left: 8000.0,
+            top: -1700.0,
+            scale: 2.0,
+            floor: -1,
+        };
+        let surface = Layer {
+            layer_id: "surface".into(),
+            scale: 1.0,
+            floor: 0,
+            ..underground.clone()
+        };
+        let other_floor = Layer {
+            floor: -2,
+            ..underground.clone()
+        };
+        let other_origin = Layer {
+            left: 8001.0,
+            ..underground.clone()
+        };
+        let mut layers = vec![underground; 20];
+        layers.extend([surface, other_floor, other_origin]);
+        deduplicate_layers(&mut layers);
+        assert_eq!(layers.len(), 4);
+        assert!(layers.iter().take(16).any(|layer| layer.floor == 0));
+        assert!(layers.iter().any(|layer| layer.floor == -2));
+        assert!(layers.iter().any(|layer| layer.left == 8001.0));
+    }
     #[test]
     fn health_reads_fill_endpoint_through_text_and_low_health_red() {
         for (length, color) in [
