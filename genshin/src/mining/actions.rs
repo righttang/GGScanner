@@ -33,7 +33,12 @@ impl Role {
         match self {
             Self::Linnea => text.contains("莉奈") || text.contains("莉奈婭"),
             Self::Zhongli => text.contains("钟离") || text.contains("鍾離"),
-            Self::Mavuika => text.contains("玛薇") || text.contains("瑪薇"),
+            Self::Mavuika => {
+                text.contains("玛薇")
+                    || text.contains("瑪薇")
+                    || text.contains("蚂薇卡")
+                    || text.contains("码薇卡")
+            },
             Self::Dehya => text.contains("迪希雅"),
         }
     }
@@ -416,6 +421,18 @@ pub fn execute_script(driver: &mut impl ActionDriver, script: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mavuika_sidebar_accepts_observed_ocr_variants_without_suffix_matching() {
+        for text in ["玛薇卡", "瑪薇卡", "蚂薇卡", "//码薇卡、"] {
+            assert!(Role::Mavuika.matches(text), "{text}");
+            assert!(!Role::Linnea.matches(text));
+            assert!(!Role::Zhongli.matches(text));
+            assert!(!Role::Dehya.matches(text));
+        }
+        for text in ["薇卡", "蚂薇", "码薇", "莉奈娅", "钟离", "迪希雅"] {
+            assert!(!Role::Mavuika.matches(text), "{text}");
+        }
+    }
     #[test]
     fn parses_ground_mining_and_camera_commands_without_splitting_arguments() {
         assert_eq!(

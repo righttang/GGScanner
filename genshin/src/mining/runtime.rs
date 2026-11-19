@@ -147,6 +147,16 @@ fn party_switch_health_safe(
         && (!enemy || hp >= 0.45)
 }
 
+#[cfg(any(windows, test))]
+fn can_reuse_role(
+    cached_role: Option<super::actions::Role>,
+    requested_role: super::actions::Role,
+    cached_slot: Option<usize>,
+    observed_slot: Option<usize>,
+) -> bool {
+    cached_role == Some(requested_role) && cached_slot.is_some() && cached_slot == observed_slot
+}
+
 pub(super) struct MovementProgress {
     anchor: (f64, f64),
     unchanged: usize,
@@ -583,6 +593,16 @@ mod windows {
             );
         }
         fn select_role(&mut self, role: Role) -> Result<()> {
+            if self.selected_role == Some(role)
+                && can_reuse_role(
+                    self.selected_role,
+                    role,
+                    self.selected_slot,
+                    super::super::vision::active_party_slot(&self.frame()?),
+                )
+            {
+                return Ok(());
+            }
             let mut names = Vec::new();
             for _ in 0..3 {
                 self.wait(400)?;
@@ -2260,7 +2280,10 @@ mod windows {
         }
         game.wait(600)?;
         ensure!(
-            super::super::vision::aiming_active(&game.frame()?),
+            observe_stable_state(true, || {
+                game.wait(100)?;
+                Ok(super::super::vision::aiming_active(&game.frame()?))
+            })?,
             "Could not enter aiming mode"
         );
         let initial_shots = report.shots;
@@ -2398,6 +2421,41 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn role_cache_requires_the_same_role_and_a_fresh_confirmed_slot() {
+        use super::super::actions::Role;
+        assert!(can_reuse_role(
+            Some(Role::Mavuika),
+            Role::Mavuika,
+            Some(0),
+            Some(0)
+        ));
+        assert!(!can_reuse_role(
+            Some(Role::Mavuika),
+            Role::Mavuika,
+            None,
+            None
+        ));
+        assert!(!can_reuse_role(
+            Some(Role::Mavuika),
+            Role::Mavuika,
+            Some(0),
+            None
+        ));
+        assert!(!can_reuse_role(
+            Some(Role::Mavuika),
+            Role::Mavuika,
+            Some(0),
+            Some(3)
+        ));
+        assert!(!can_reuse_role(
+            Some(Role::Mavuika),
+            Role::Linnea,
+            Some(0),
+            Some(0)
+        ));
+        assert!(!can_reuse_role(None, Role::Mavuika, Some(0), Some(0)));
+    }
     #[test]
     fn switch_health_compares_only_the_same_confirmed_member() {
         // Actual failure: full-HP Zhongli -> 12036/20055 Mavuika, with the

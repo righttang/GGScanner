@@ -1150,6 +1150,17 @@ mod tests {
             .is_err());
     }
     #[test]
+    #[ignore = "requires a local aiming or world HUD frame"]
+    fn verifies_local_aiming_state() {
+        let frame = image::open(std::env::var("GGSCANNER_AIMING_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(
+            aiming_active(&frame),
+            std::env::var("GGSCANNER_EXPECT_AIMING").unwrap() == "true"
+        );
+    }
+    #[test]
     fn bright_terrain_does_not_enter_or_toggle_aiming_state() {
         let cliff = RgbImage::from_pixel(1920, 1080, image::Rgb([255, 255, 255]));
         assert!(!aiming_active(&cliff));
