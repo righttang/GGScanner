@@ -797,6 +797,16 @@ pub(super) fn party_ready_for_next_route(frame: &RgbImage, grounded: bool) -> bo
         && !enemy_health_bar(frame)
 }
 
+/// A missing inactive HP bar can mean a defeated member or an obscured HUD.
+/// Neither is permission to press a slot key and open the food revival dialog.
+pub(super) fn party_slot_available(frame: &RgbImage, slot: usize) -> bool {
+    if slot >= 4 {
+        return false;
+    }
+    active_party_slot(frame)
+        .is_some_and(|active| active == slot || sidebar_health_bars(frame)[slot])
+}
+
 pub(super) fn player_health_fraction(frame: &RgbImage) -> Option<f64> {
     let end = (810..1112)
         .filter(|&x| {
@@ -1270,6 +1280,63 @@ mod tests {
         }
         assert_eq!(active_party_slot(&RgbImage::new(100, 100)), None);
         assert!(!party_ready_for_next_route(&RgbImage::new(100, 100), true));
+    }
+    #[test]
+    fn party_switch_rejects_defeated_members_and_dialogs() {
+        let mut frame = RgbImage::from_pixel(1920, 1080, image::Rgb([255, 255, 255]));
+        for x in 810..1112 {
+            for y in 1008..1015 {
+                frame.put_pixel(x, y, image::Rgb([143, 255, 0]));
+            }
+        }
+        // Slot four is active. Keep its keycap cue even when another member's
+        // bar disappears, as happens after that member is defeated.
+        for x in 1856..1889 {
+            for y in 540..565 {
+                frame.put_pixel(x, y, image::Rgb([150, 150, 150]));
+            }
+        }
+        for slot in 0..3 {
+            for x in 1692..1762 {
+                for y in 288 + slot * 92..293 + slot * 92 {
+                    frame.put_pixel(x, y, image::Rgb([143, 255, 0]));
+                }
+            }
+        }
+        for slot in 0..4 {
+            assert!(party_slot_available(&frame, slot));
+        }
+        for x in 1692..1762 {
+            for y in 288..293 {
+                frame.put_pixel(x, y, image::Rgb([90, 90, 90]));
+            }
+        }
+        assert_eq!(active_party_slot(&frame), Some(3));
+        assert!(!party_slot_available(&frame, 0));
+        assert!(party_slot_available(&frame, 1));
+        assert!(party_slot_available(&frame, 3));
+        // A darkened dialog can retain scenery/keycaps but is not a world HUD.
+        for x in 810..1112 {
+            for y in 1008..1015 {
+                frame.put_pixel(x, y, image::Rgb([90, 90, 90]));
+            }
+        }
+        for slot in 0..=4 {
+            assert!(!party_slot_available(&frame, slot));
+        }
+    }
+    #[test]
+    #[ignore = "requires a local party HUD frame and target slot"]
+    fn verifies_local_party_switch_availability() {
+        let frame = image::open(std::env::var("GGSCANNER_PARTY_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let slot = std::env::var("GGSCANNER_TARGET_SLOT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let expected = std::env::var("GGSCANNER_TARGET_AVAILABLE").unwrap() == "true";
+        assert_eq!(party_slot_available(&frame, slot), expected);
     }
     #[test]
     #[ignore = "requires a local party HUD frame"]

@@ -201,6 +201,8 @@ mod windows {
         sight_refreshed: Option<Instant>,
         aiming: bool,
         selected_role: Option<Role>,
+        selected_slot: Option<usize>,
+        combat_active: bool,
         script_deadline: Option<Instant>,
         loot_tracker: super::super::loot::LootTracker,
         started: Instant,
@@ -220,6 +222,7 @@ mod windows {
             self.check()?;
             if matches!(key, Key::Layout('1'..='4')) {
                 self.selected_role = None;
+                self.selected_slot = None;
             }
             self.ctrl.system_control.key_down(key)
         }
@@ -277,8 +280,17 @@ mod windows {
         }
         fn wait(&self, ms: u64) -> Result<()> {
             let deadline = Instant::now() + Duration::from_millis(ms);
+            let mut checked_health = Instant::now();
             while Instant::now() < deadline {
                 self.check()?;
+                if self.combat_active && checked_health.elapsed() >= Duration::from_millis(250) {
+                    ensure!(
+                        super::super::vision::player_health_fraction(&self.frame()?)
+                            .is_some_and(|hp| hp >= 0.50),
+                        "Health too low or unconfirmed during combat action"
+                    );
+                    checked_health = Instant::now();
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
             Ok(())
@@ -395,6 +407,15 @@ mod windows {
         }
 
         fn ore_frame(&mut self) -> Result<RgbImage> {
+            let before = self.frame()?;
+            ensure!(
+                super::super::vision::player_health_fraction(&before).is_some_and(|hp| hp >= 0.45),
+                "Health too low or unconfirmed for ore aiming"
+            );
+            ensure!(
+                !super::super::vision::enemy_health_bar(&before),
+                "Enemy approached during ore aiming"
+            );
             if self
                 .sight_refreshed
                 .is_none_or(|time| time.elapsed() >= Duration::from_millis(2500))
@@ -416,15 +437,44 @@ mod windows {
             ensure!(slot < 4, "Party slot is outside the active party");
             let before = self.frame()?;
             if super::super::vision::active_party_slot(&before) == Some(slot) {
+                self.selected_slot = Some(slot);
                 return Ok(());
             }
             for _ in 0..3 {
+                let before = self.frame()?;
+                ensure!(
+                    super::super::vision::party_slot_available(&before, slot),
+                    "Party slot {} is defeated, too low on health or its HUD is unconfirmed",
+                    slot + 1
+                );
+                let initial_hp = super::super::vision::player_health_fraction(&before).unwrap();
                 self.key(Key::Layout(char::from(b'1' + slot as u8)))?;
-                // Include network acknowledgement and the shared switch CD.
-                self.wait(1500)?;
-                let after = self.frame()?;
-                if super::super::vision::active_party_slot(&after) == Some(slot) {
-                    return Ok(());
+                // Poll acknowledgement instead of standing exposed for the
+                // full shared switch CD after every successful change.
+                let deadline = Instant::now() + Duration::from_millis(1500);
+                let mut confirmed = false;
+                while Instant::now() < deadline {
+                    self.wait(100)?;
+                    let after = self.frame()?;
+                    if super::super::vision::active_party_slot(&after) == Some(slot) {
+                        if confirmed {
+                            self.selected_slot = Some(slot);
+                            return Ok(());
+                        }
+                        confirmed = true;
+                        continue;
+                    }
+                    confirmed = false;
+                    ensure!(
+                        super::super::vision::party_slot_available(&after, slot),
+                        "Party switch became unavailable; no further slot keys will be sent"
+                    );
+                    let hp = super::super::vision::player_health_fraction(&after).unwrap();
+                    ensure!(
+                        hp >= initial_hp - 0.15
+                            && (!super::super::vision::enemy_health_bar(&after) || hp >= 0.45),
+                        "Health fell while party switching was blocked"
+                    );
                 }
                 self.wait(250)?;
             }
@@ -451,6 +501,7 @@ mod windows {
                         let active = super::super::vision::active_party_slot(&frame);
                         if active == Some(slot as usize) {
                             self.selected_role = Some(role);
+                            self.selected_slot = Some(slot as usize);
                             return Ok(());
                         }
                         self.select_slot(slot as usize)
@@ -709,6 +760,8 @@ mod windows {
             sight_refreshed: None,
             aiming: false,
             selected_role: None,
+            selected_slot: None,
+            combat_active: false,
             script_deadline: None,
             loot_tracker: Default::default(),
             started: Instant::now(),
@@ -826,6 +879,7 @@ mod windows {
                             point.action == "force_tp",
                         )?;
                         game.selected_role = None;
+                        game.selected_slot = None;
                         position = Some(locate(&game, mini_locator, Some(landing), 50)?);
                         report.map_floor = mini_locator.last_floor;
                         let landed = position.unwrap();
@@ -847,6 +901,20 @@ mod windows {
                             report,
                         )?);
                         pickup_visible(&mut game, progress, report)?;
+                    }
+                    // A clear scene before walking does not establish safety
+                    // at the destination. Do not enter a long aiming loop with
+                    // enemies that came into view during the movement leg.
+                    if !game.underwater_route
+                        && point.action != "fight"
+                        && matches!(point.action.as_str(), "mining" | "linnea_mining")
+                        && super::super::vision::enemy_health_bar(&game.frame()?)
+                    {
+                        fight(&mut game, progress, report)?;
+                        position = Some(
+                            locate(&game, mini_locator, position, 60)
+                                .or_else(|_| locate(&game, mini_locator, position, 250))?,
+                        );
                     }
                     report.map_floor = mini_locator.last_floor;
                     match point.action.as_str() {
@@ -1162,8 +1230,15 @@ mod windows {
             }
             let frame = self.game.frame()?;
             ensure!(
-                super::super::vision::player_health_fraction(&frame).is_none_or(|hp| hp >= 0.30),
-                "Health too low for navigation"
+                super::super::vision::player_health_fraction(&frame).is_some_and(|hp| hp >= 0.45),
+                "Health too low or unconfirmed for navigation"
+            );
+            ensure!(
+                !matches!(
+                    (self.game.selected_slot, super::super::vision::active_party_slot(&frame)),
+                    (Some(expected), Some(active)) if active != expected
+                ),
+                "Active party member changed unexpectedly during navigation"
             );
             let mut position = self
                 .mini
@@ -1703,6 +1778,17 @@ mod windows {
         progress: &MiningProgress<'_>,
         report: &mut MiningReport,
     ) -> Result<()> {
+        game.combat_active = true;
+        let result = fight_inner(game, progress, report);
+        game.combat_active = false;
+        result
+    }
+
+    fn fight_inner(
+        game: &mut Game<'_>,
+        progress: &MiningProgress<'_>,
+        report: &mut MiningReport,
+    ) -> Result<()> {
         report.phase = "fighting".into();
         progress(report);
         let started = Instant::now();
@@ -1717,7 +1803,7 @@ mod windows {
             );
             let frame = game.frame()?;
             ensure!(
-                super::super::vision::player_health_fraction(&frame).is_some_and(|hp| hp >= 0.40),
+                super::super::vision::player_health_fraction(&frame).is_some_and(|hp| hp >= 0.50),
                 "Health too low or unconfirmed for automatic combat"
             );
             let enemy = super::super::vision::enemy_health_bar(&frame);
@@ -1767,12 +1853,23 @@ mod windows {
                     actions::execute_script(game, "钟离 e(hold)")?;
                     last_shield = Some(Instant::now());
                 }
+                ensure!(
+                    super::super::vision::player_health_fraction(&game.frame()?)
+                        .is_some_and(|hp| hp >= 0.50),
+                    "Health too low or unconfirmed after shielding"
+                );
+                if game.selected_role != Some(Role::Mavuika) && game.motion()? == Motion::Ground {
+                    // A short dash can leave hit-stun before switching from
+                    // the shield character. The caller relocalizes after combat.
+                    game.key(Key::Shift)?;
+                    game.wait(150)?;
+                }
                 game.select_role(Role::Mavuika)?;
                 if last_fire.is_none_or(|time| time.elapsed() >= Duration::from_secs(16)) {
                     game.press(GameKey::Skill)?;
                     last_fire = Some(Instant::now());
                 }
-                actions::execute_script(game, "attack(1.5)")?;
+                actions::execute_script(game, "attack(0.45)")?;
             } else if saw_enemy {
                 // Finish a nearly depleted bar before the clearance window;
                 // its final few pixels may be below the vision threshold.
