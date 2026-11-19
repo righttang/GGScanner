@@ -43,6 +43,7 @@ Skill 后可读 [在线规范](https://github.com/righttang/GGScanner/blob/main/
 - 检查每个矿点的 `outcome`、`shots`、`loot` 和 `error`。射箭不等于收获，
   `unconfirmed` 表示未读到收获提示，`noOre` 表示未识别到矿石。需要精确总量时，
   对比背包前后数量；提示识别可能漏读或重复计数。最新报告保存在 `data/mining/last-report.json`。
+- 掉落等待期间也会持续检查矿物 F 提示，避免技能动画结束后才出现的掉落被漏捡；只拾取当前选中且名称为矿物的提示。
 
 客户端命令 `mining-routes`、`mining-refresh`、`mining-download`、`mining-import`
 对应路线库；`mine request.json` 提交任务。普通玩家无需操作网页。

@@ -22,6 +22,27 @@ pub fn ore_name(text: &str) -> Option<&'static str> {
         .max_by_key(|name| name.len())
 }
 
+pub(super) fn pickup_prompts(
+    frame: &RgbImage,
+    mut read: impl FnMut(u32, u32, u32, u32) -> Result<String>,
+    motion: &super::motion::MotionDetector,
+) -> Result<Vec<(u32, String, bool)>> {
+    let mut prompts = Vec::new();
+    for (top, height) in super::vision::text_rows(frame, 1070, 330, 530, 420) {
+        let text = read(1070, top, 530, height)?;
+        if !text.trim().is_empty() {
+            prompts.push((top, text, motion.ore_prompt_key(frame, top, 42)));
+        }
+    }
+    Ok(prompts)
+}
+
+pub(super) fn has_ore_pickup(prompts: &[(u32, String, bool)]) -> bool {
+    prompts
+        .iter()
+        .any(|(_, text, key)| *key && ore_name(text).is_some())
+}
+
 pub fn parse_line(text: &str) -> Option<(&'static str, usize)> {
     let name = ore_name(text)?;
     let (_, tail) = text.split_once(name)?;
@@ -146,6 +167,40 @@ mod tests {
         tracker.observe(2600, BTreeMap::new());
         let mixed = BTreeMap::from([("白铁块".into(), 1), ("铁块".into(), 1)]);
         assert_eq!(tracker.observe(2800, mixed.clone()), mixed);
+    }
+    #[test]
+    fn pickup_requires_the_selected_ore_row() {
+        assert!(has_ore_pickup(&[(448, "日萃凝晶".into(), true)]));
+        assert!(!has_ore_pickup(&[
+            (448, "调查".into(), true),
+            (523, "萃凝晶".into(), false),
+        ]));
+        assert!(!has_ore_pickup(&[(448, "萃凝晶".into(), false)]));
+        assert!(!has_ore_pickup(&[(448, "对话".into(), true)]));
+    }
+    #[test]
+    #[ignore = "requires a local ore interaction frame and OCR model"]
+    fn reads_local_ore_pickup_prompt() {
+        let frame = image::open(std::env::var("GGSCANNER_MINING_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let ocr = crate::scanner::common::ocr_factory::create_ocr_model("ppocrv4").unwrap();
+        let prompts = pickup_prompts(
+            &frame,
+            |x, y, w, h| {
+                ocr.image_to_text(
+                    &image::imageops::crop_imm(&frame, x, y, w, h).to_image(),
+                    false,
+                )
+            },
+            &super::super::motion::MotionDetector::new().unwrap(),
+        )
+        .unwrap();
+        println!("Pickup prompts: {prompts:?}");
+        assert_eq!(
+            has_ore_pickup(&prompts),
+            std::env::var("GGSCANNER_EXPECT_PICKUP").unwrap() == "true"
+        );
     }
     #[test]
     #[ignore = "requires a local acquisition feed frame and OCR model"]

@@ -33,6 +33,8 @@ by the selected routes; the runtime reads their existing party slots. It does
 not edit party presets or equipment. Ground mining includes cooldown waits,
 ore-labelled F prompts and a bounded nearby pickup sweep. OCR loot estimates
 can miss or duplicate notifications; use inventory comparisons for exact quantities.
+The loot settling window keeps checking ore-labelled F prompts so drops that
+become interactable after the break animation are picked up as well.
 A shot, skill cast or completed walk without acquisition is `unconfirmed`.
 After a route failure, `recovery.outcome` distinguishes `ready` (ground HUD,
 living party and sufficient active HP confirmed), `healed` (all four members

@@ -1900,13 +1900,11 @@ mod windows {
                     }
                 }
             }
-            let mut prompts = Vec::new();
-            for (top, height) in super::super::vision::text_rows(&frame, 1070, 330, 530, 420) {
-                let text = game.read(&frame, 1070, top, 530, height)?;
-                if !text.trim().is_empty() {
-                    prompts.push((top, text));
-                }
-            }
+            let prompts = super::super::loot::pickup_prompts(
+                &frame,
+                |x, y, w, h| game.read(&frame, x, y, w, h),
+                &game.motion,
+            )?;
             if cfg!(debug_assertions) {
                 if let Ok(bytes) = serde_json::to_vec_pretty(&prompts) {
                     let _ = super::super::routes::write_cache(
@@ -1917,10 +1915,7 @@ mod windows {
             }
             // Only use an ore-labelled F prompt. Never select an unrelated
             // NPC, quest or object merely because an interaction is available.
-            let is_ore = prompts.iter().any(|(top, text)| {
-                super::super::loot::ore_name(text).is_some()
-                    && game.motion.ore_prompt_key(&frame, *top, 42)
-            });
+            let is_ore = super::super::loot::has_ore_pickup(&prompts);
             if !is_ore {
                 break;
             }
@@ -1944,8 +1939,13 @@ mod windows {
         let mut last_gain = None;
         while Instant::now() < deadline {
             game.wait(200)?;
+            let before = report.loot.values().sum::<usize>();
+            // Break/charge animations can delay the F prompt beyond the
+            // initial pickup pass. Continue observing it while loot settles;
+            // an ore label and its selected-row key are still both required.
+            pickup_visible(game, progress, report)?;
             let frame = game.frame()?;
-            if game.record_loot(&frame, report)? {
+            if game.record_loot(&frame, report)? || report.loot.values().sum::<usize>() > before {
                 last_gain = Some(Instant::now());
             }
             progress(report);
@@ -1986,7 +1986,7 @@ mod windows {
                 pickup_visible(game, progress, report)?;
             }
         }
-        poll_loot(game, report, progress, 2000)
+        poll_loot(game, report, progress, 3000)
     }
 
     fn finish_ground_mine(
