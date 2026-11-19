@@ -65,6 +65,9 @@ Failures preserve one local `last-route-failure.png` and JSON with the latest
 Mini-map tracking uses local terrain templates. Layer manifests include caves;
 optional `info.floor` disambiguates overlapping floors. An ambiguous position or floor
 stops the route. `mapFloor` reports the most recently confirmed floor.
+Near a waypoint, turning accounts for small position jitter while preserving
+the arrival distance check. Continuous stationary turns also run the bounded
+no-progress escape logic instead of waiting for the full waypoint timeout.
 Ground movement does not imply floor 0: unpinned routes can follow visually
 confirmed layers into caves; explicit floor metadata remains a constraint.
 

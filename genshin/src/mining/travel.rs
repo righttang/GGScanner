@@ -132,10 +132,44 @@ fn follow_inner(
                 "Gliding ended before the waypoint"
             );
         }
+        // Turning in place must not bypass the no-progress watchdog. A noisy
+        // close-range heading used to stay in that branch for all 240 seconds.
+        let unintended_climb =
+            observation.motion == Motion::Climbing && !matches!(mode, "climb" | "fly");
+        let stuck = if now - progress_at >= 1000 {
+            progress_at = now;
+            mode != "climb" && progress.observe(current).is_err()
+        } else {
+            false
+        };
+        if stuck || unintended_climb {
+            ensure!(
+                escapes < 3,
+                "Waypoint remains blocked after three escape attempts"
+            );
+            escape(d, escapes, observation.motion)?;
+            escapes += 1;
+            forward = false;
+            sprint = false;
+            observation = d.observe(current, true)?;
+            progress = super::runtime::MovementProgress::new(observation.position, target);
+            progress_at = d.time_ms();
+            continue;
+        }
         let desired = (current.1 - target.1).atan2(current.0 - target.0);
         let error = angle_difference(desired, observation.heading);
+        // A roughly 1.5-unit localization shift can change the apparent target
+        // bearing by tens of degrees at close range. Keep the 2-unit arrival
+        // check; avoid chasing a more precise bearing than that position allows.
+        let heading_tolerance = if remaining < 6.0 {
+            (1.5 / remaining.max(2.0))
+                .atan()
+                .clamp(5.0_f64.to_radians(), 35.0_f64.to_radians())
+        } else {
+            5.0_f64.to_radians()
+        };
         let mut stationary_turn = false;
-        if error.abs() > 5.0_f64.to_radians() {
+        if error.abs() > heading_tolerance {
             turn_frames += 1;
             let since = *turn_since.get_or_insert(now);
             stationary_turn = remaining < 6.0
@@ -168,28 +202,6 @@ fn follow_inner(
             pulse(d, Key::Space, 60)?;
             d.wait(200)?;
             observation = d.observe(current, false)?;
-            continue;
-        }
-        let unintended_climb =
-            observation.motion == Motion::Climbing && !matches!(mode, "climb" | "fly");
-        let stuck = if now - progress_at >= 1000 {
-            progress_at = now;
-            mode != "climb" && progress.observe(current).is_err()
-        } else {
-            false
-        };
-        if stuck || unintended_climb {
-            ensure!(
-                escapes < 3,
-                "Waypoint remains blocked after three escape attempts"
-            );
-            escape(d, escapes, observation.motion)?;
-            escapes += 1;
-            forward = false;
-            sprint = false;
-            observation = d.observe(current, true)?;
-            progress = super::runtime::MovementProgress::new(observation.position, target);
-            progress_at = d.time_ms();
             continue;
         }
         if mode == "jump" && now - jump_at >= 1000 {
@@ -236,6 +248,8 @@ mod tests {
         permanent: bool,
         cancel_at: u64,
         fail: bool,
+        direction_coupled_jitter: bool,
+        ignore_turns: bool,
     }
     impl KeyDriver for Replay {
         fn key_down(&mut self, k: Key) -> Result<()> {
@@ -262,8 +276,21 @@ mod tests {
                 self.key_up(Key::Layout('w'))?;
             }
             ensure!(!self.fail, "capture failed");
+            let position = if self.direction_coupled_jitter {
+                // The actual A03 trace alternated these +/- 0.5 offsets as
+                // the viewing cone rotated across the mini-map terrain.
+                let offset = if self.heading.rem_euclid(std::f64::consts::TAU).to_degrees() > 147.0
+                {
+                    0.5
+                } else {
+                    -0.5
+                };
+                (self.p.0 + offset, self.p.1 + offset)
+            } else {
+                self.p
+            };
             Ok(Observation {
-                position: self.p,
+                position,
                 heading: self.heading,
                 motion: self.mode,
                 grounded: self.mode == Motion::Ground,
@@ -271,7 +298,9 @@ mod tests {
             })
         }
         fn turn(&mut self, r: f64) -> Result<()> {
-            self.heading += r;
+            if !self.ignore_turns {
+                self.heading += r;
+            }
             self.wait(30)
         }
         fn wait(&mut self, ms: u64) -> Result<()> {
@@ -300,7 +329,39 @@ mod tests {
             permanent: false,
             cancel_at: u64::MAX,
             fail: false,
+            direction_coupled_jitter: false,
+            ignore_turns: false,
         }
+    }
+    #[test]
+    fn regression_near_waypoint_jitter_does_not_spin_in_place() {
+        let mut d = replay(Motion::Underwater);
+        d.p = (4358.0, 3951.0);
+        d.heading = 138.0_f64.to_radians();
+        d.direction_coupled_jitter = true;
+        let target = (4361.1631, 3948.9119);
+        let start = d.p;
+        let position = follow(&mut d, start, target, "walk").unwrap();
+        assert!(distance(position, target) < 2.0);
+        assert!(distance(d.p, target) < 3.0);
+        assert!(d.now < 15_000);
+        assert!(!d.events.contains(&Key::Layout('s')));
+        assert!(d.held.is_empty());
+    }
+    #[test]
+    fn regression_stationary_turns_still_trigger_bounded_escape() {
+        let mut d = replay(Motion::Underwater);
+        d.heading = std::f64::consts::FRAC_PI_2;
+        d.ignore_turns = true;
+        d.blocked = true;
+        d.permanent = true;
+        let result = follow(&mut d, (40.0, 0.0), (0.0, 0.0), "walk");
+        assert!(result.is_err());
+        assert!(d.events.contains(&Key::Layout('s')));
+        assert!(d.events.contains(&Key::Layout('a')));
+        assert!(d.events.contains(&Key::Layout('d')));
+        assert!(d.now < 60_000);
+        assert!(d.held.is_empty());
     }
     #[test]
     fn follows_ground_glide_and_underwater_with_turns_and_fine_approach() {
