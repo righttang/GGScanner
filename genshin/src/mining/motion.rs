@@ -189,15 +189,56 @@ pub(super) fn crab_reference_matches(frame: &RgbImage) -> Result<bool> {
     if !path.is_file() {
         return Ok(false);
     }
-    let template = image::open(path)?.to_luma8();
-    let skill =
-        imageops::grayscale(&imageops::crop_imm(frame, UNDERWATER_SKILL_X, 938, 74, 84).to_image());
-    Ok(match_glyph(&skill, &template) >= 0.84)
+    Ok(crab_icon_matches(frame, &image::open(path)?.to_rgb8()))
+}
+
+fn crab_icon_matches(frame: &RgbImage, template: &RgbImage) -> bool {
+    let skill = imageops::crop_imm(frame, UNDERWATER_SKILL_X, 938, 74, 84).to_image();
+    match_glyph(&imageops::grayscale(&skill), &imageops::grayscale(template)) >= 0.84
+        || white_glyph_score(&skill, template) >= 0.88
+}
+
+/// UI glyphs stay neutral white while the translucent background changes.
+/// Compare the whole foreground shape, including unexpected white pixels,
+/// rather than allowing bright plants to dominate grayscale correlation.
+fn white_glyph_score(frame: &RgbImage, template: &RgbImage) -> f64 {
+    if frame.width() < template.width() || frame.height() < template.height() {
+        return 0.0;
+    }
+    let white = |p: &image::Rgb<u8>| {
+        let lo = *p.0.iter().min().unwrap();
+        let hi = *p.0.iter().max().unwrap();
+        lo > 210 && hi - lo < 45
+    };
+    let reference: Vec<_> = template.pixels().map(white).collect();
+    let count = reference.iter().filter(|&&p| p).count();
+    if count < 24 || count * 10 > reference.len() * 7 {
+        return 0.0;
+    }
+    let mut best = 0.0_f64;
+    for y in 0..=frame.height() - template.height() {
+        for x in 0..=frame.width() - template.width() {
+            let (mut intersection, mut union) = (0, count);
+            for ty in 0..template.height() {
+                for tx in 0..template.width() {
+                    if white(frame.get_pixel(x + tx, y + ty)) {
+                        if reference[(ty * template.width() + tx) as usize] {
+                            intersection += 1;
+                        } else {
+                            union += 1;
+                        }
+                    }
+                }
+            }
+            best = best.max(intersection as f64 / union as f64);
+        }
+    }
+    best
 }
 
 pub(super) fn save_crab_reference(frame: &RgbImage) -> Result<()> {
-    // Use the icon's interior so the cooldown digits and keyboard label cannot
-    // become the learned feature. Calibration is an explicit local operation.
+    // Keep the keyboard label outside the reference. The operator confirms
+    // the ready crab glyph, without a cooldown overlay, before calibration.
     let icon = imageops::crop_imm(frame, UNDERWATER_SKILL_X + 10, 955, 58, 58).to_image();
     let mut bytes = std::io::Cursor::new(Vec::new());
     icon.write_to(&mut bytes, image::ImageFormat::Png)?;
@@ -210,6 +251,62 @@ pub(super) fn save_crab_reference(frame: &RgbImage) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn white_skill_shape_survives_cyan_background_but_rejects_brightness_and_wrong_shapes() {
+        let mut template = RgbImage::from_pixel(17, 17, image::Rgb([20, 50, 60]));
+        for y in 2..15 {
+            for x in 2..15 {
+                if x == y || x + y == 16 || y == 8 {
+                    template.put_pixel(x, y, image::Rgb([255, 255, 255]));
+                }
+            }
+        }
+        let mut bright = RgbImage::from_pixel(23, 24, image::Rgb([20, 240, 255]));
+        for (x, y, p) in template.enumerate_pixels() {
+            if p.0 == [255, 255, 255] {
+                bright.put_pixel(x + 3, y + 4, image::Rgb([245, 245, 250]));
+            }
+        }
+        assert!(white_glyph_score(&bright, &template) > 0.99);
+        assert!(
+            white_glyph_score(
+                &RgbImage::from_pixel(23, 24, image::Rgb([255, 255, 255])),
+                &template
+            ) < 0.3
+        );
+        assert_eq!(white_glyph_score(&RgbImage::new(23, 24), &template), 0.0);
+        let wrong = RgbImage::from_fn(23, 24, |x, _| {
+            if x % 4 == 0 {
+                image::Rgb([255, 255, 255])
+            } else {
+                image::Rgb([20, 240, 255])
+            }
+        });
+        assert!(white_glyph_score(&wrong, &template) < 0.5);
+    }
+    #[test]
+    #[ignore = "requires a local skill frame and confirmed crab reference"]
+    fn verify_local_crab_icon() {
+        let frame = image::open(std::env::var("GGSCANNER_MOTION_FRAME").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let template = image::open(std::env::var("GGSCANNER_CRAB_REFERENCE").unwrap())
+            .unwrap()
+            .to_rgb8();
+        let skill = imageops::crop_imm(&frame, UNDERWATER_SKILL_X, 938, 74, 84).to_image();
+        println!(
+            "Crab icon NCC {}, white-shape {}",
+            match_glyph(
+                &imageops::grayscale(&skill),
+                &imageops::grayscale(&template)
+            ),
+            white_glyph_score(&skill, &template)
+        );
+        assert_eq!(
+            crab_icon_matches(&frame, &template),
+            std::env::var("GGSCANNER_EXPECT_CRAB").unwrap() == "true"
+        );
+    }
     #[test]
     fn masked_glyph_requires_visible_shape_and_rejects_complete_occlusion() {
         let glyph = GrayImage::from_fn(9, 7, |x, y| {
