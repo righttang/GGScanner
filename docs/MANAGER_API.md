@@ -63,6 +63,10 @@ is observed without sending further toggles, and cancellation or lost focus stop
 Route teleport coordinates select a nearby known anchor; the runtime checks
 that anchor's canonical icon, menu and landing rather than treating the recorded
 sample as the exact spawn. `force_tp` also teleports when already near the anchor.
+The target viewport rechecks the surface-map control after panning; the layer
+column is recognized both with and without an anchor details panel. Nearby
+anchors trigger bounded zoom-in steps and a fresh map projection before clicking,
+while the canonical icon and landing checks remain unchanged.
 Failures preserve one local `last-route-failure.png` and JSON with the latest
 64 navigation observations for diagnosis. `lastTeleport` records the requested
 anchor, latest map projection, icon click, and latest landing position or error;

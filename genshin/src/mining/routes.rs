@@ -254,7 +254,7 @@ pub struct RouteEntry {
     pub last_run: Option<RouteValidation>,
 }
 
-pub const ENGINE_REVISION: &str = "mining-20261120-v13";
+pub const ENGINE_REVISION: &str = "mining-20261120-v14";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteValidation {

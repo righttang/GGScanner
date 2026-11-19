@@ -34,6 +34,9 @@ impl TeleportAnchor {
     pub fn correction_limit(&self, scale: f64) -> f64 {
         (self.neighbor_distance / (4.0 * scale) * 0.3).clamp(6.0, 36.0)
     }
+    pub fn selection_needs_zoom(&self, scale: f64) -> bool {
+        self.neighbor_distance / (4.0 * scale) < 64.0
+    }
     pub fn icon(&self) -> &str {
         match self.kind.as_str() {
             "Goddess" => "StatueOfTheSeven.png",
@@ -163,6 +166,17 @@ impl TeleportCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn close_surface_and_underground_anchors_require_more_screen_separation() {
+        let catalog=TeleportCatalog::parse(br#"{"data":[{"mapName":"Teyvat","points":[
+          {"id":881,"type":"TeleportWaypoint","position":[2426.179,476.093,4687.642],"tranPosition":[2429.8247,477.72775,4689.8623]},
+          {"id":1064,"type":"TeleportWaypoint","position":[2388.956,234.162,4717.727],"tranPosition":[2391.469,234.14375,4712.9453]}
+        ]}]}"#).unwrap();
+        let surface = catalog.route_anchor((4689.9121, 2430.4626)).unwrap();
+        assert_eq!(surface.id, 881);
+        assert!(surface.selection_needs_zoom(0.382256));
+        assert!(!surface.selection_needs_zoom(0.10));
+    }
     #[test]
     fn overlapping_workshop_and_anchor_select_the_correct_destination() {
         let catalog=TeleportCatalog::parse(br#"{"data":[{"mapName":"Teyvat","points":[

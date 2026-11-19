@@ -82,12 +82,25 @@ impl MotionDetector {
         match_glyph(&area, &self.interact) >= 0.84
     }
     pub fn ground_button(&self, frame: &RgbImage) -> Option<(f64, f64)> {
-        let area = imageops::grayscale(&imageops::crop_imm(frame, 1800, 250, 90, 570).to_image());
-        let (score, x, y) = find_glyph(&area, &self.ground);
-        (score >= 0.84).then_some((
-            1800.0 + x as f64 + self.ground.width() as f64 / 2.0,
-            250.0 + y as f64 + self.ground.height() as f64 / 2.0,
-        ))
+        // The layer column shifts left when an anchor's details panel opens.
+        // Keep the same glyph threshold in both observed map layouts.
+        [1800, 1320]
+            .into_iter()
+            .map(|left| {
+                let area =
+                    imageops::grayscale(&imageops::crop_imm(frame, left, 250, 90, 570).to_image());
+                let (score, x, y) = find_glyph(&area, &self.ground);
+                (
+                    score,
+                    (
+                        left as f64 + x as f64 + self.ground.width() as f64 / 2.0,
+                        250.0 + y as f64 + self.ground.height() as f64 / 2.0,
+                    ),
+                )
+            })
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .filter(|matched| matched.0 >= 0.84)
+            .map(|matched| matched.1)
     }
     pub fn borrowed_skill_present(&self, frame: &RgbImage) -> bool {
         self.skill_key_present(frame, UNDERWATER_SKILL_X)
@@ -387,7 +400,19 @@ mod tests {
             .ground_button(&frame)
             .unwrap();
         assert!(
-            (p.0 - 1844.0).abs() < 5.0 && (p.1 - 442.0).abs() < 5.0,
+            (p.0 - std::env::var("GGSCANNER_GROUND_X")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(1844.0))
+            .abs()
+                < 5.0
+                && (p.1
+                    - std::env::var("GGSCANNER_GROUND_Y")
+                        .ok()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(442.0))
+                .abs()
+                    < 5.0,
             "{p:?}"
         );
     }

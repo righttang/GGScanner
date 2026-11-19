@@ -1630,6 +1630,8 @@ mod windows {
         let mut recognition_failures = 0;
         let mut zoom_recoveries = 0;
         let mut click_retries = 0;
+        let mut target_ground_checked = false;
+        let mut selection_zoom_steps = 0;
         let map_started = Instant::now();
         for _ in 0..40 {
             ensure!(
@@ -1698,6 +1700,26 @@ mod windows {
                 );
             }
             if Projection::clickable((screen_x, screen_y)) {
+                // Layer controls can appear only after panning into a cave's
+                // region. The region-menu check alone cannot establish the
+                // layer of the target viewport. Re-observe after this click.
+                if !target_ground_checked {
+                    target_ground_checked = true;
+                    if let Some((x, y)) = game.motion.ground_button(&frame) {
+                        game.click(x, y)?;
+                        game.wait(500)?;
+                        predicted = None;
+                        before_pan = None;
+                        continue;
+                    }
+                }
+                if anchor.selection_needs_zoom(scale) && selection_zoom_steps < 3 {
+                    game.set_map_zoom([536.0, 505.0, 490.0][selection_zoom_steps])?;
+                    selection_zoom_steps += 1;
+                    predicted = None;
+                    before_pan = None;
+                    continue;
+                }
                 let point =
                     match game
                         .anchor_icons
