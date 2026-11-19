@@ -133,7 +133,7 @@ fn observe_stable_state(expected: bool, mut sample: impl FnMut() -> Result<bool>
 
 #[cfg(any(windows, test))]
 fn party_switch_health_safe(
-    previous_slot: Option<usize>,
+    confirmed_previous_slot: Option<usize>,
     observed_slot: Option<usize>,
     initial_hp: f64,
     hp: f64,
@@ -141,7 +141,9 @@ fn party_switch_health_safe(
 ) -> bool {
     // Percentages belong to a character, not the whole party. A switch fade
     // can expose the new HP bar before its active-slot badge is recognizable.
-    (previous_slot.is_none() || observed_slot != previous_slot || hp >= initial_hp - 0.15)
+    (confirmed_previous_slot.is_none()
+        || observed_slot != confirmed_previous_slot
+        || hp >= initial_hp - 0.15)
         && (!enemy || hp >= 0.45)
 }
 
@@ -538,7 +540,9 @@ mod windows {
                     if let Some(hp) = super::super::vision::player_health_fraction(&after) {
                         ensure!(
                             party_switch_health_safe(
-                                previous_slot,
+                                // The old badge can coexist with the new HP
+                                // bar throughout the switch animation.
+                                None,
                                 observed_slot,
                                 initial_hp,
                                 hp,
@@ -547,6 +551,23 @@ mod windows {
                             "Health fell while party switching was blocked"
                         );
                     }
+                }
+                // Only a timed-out acknowledgement can establish that a
+                // character remained blocked. Keep absolute enemy HP checks
+                // above active throughout the animation without comparing
+                // the old member's fraction with the new member's fraction.
+                let after = self.frame()?;
+                if let Some(hp) = super::super::vision::player_health_fraction(&after) {
+                    ensure!(
+                        party_switch_health_safe(
+                            previous_slot,
+                            super::super::vision::active_party_slot(&after),
+                            initial_hp,
+                            hp,
+                            super::super::vision::enemy_health_bar(&after),
+                        ),
+                        "Health fell while party switching was blocked after acknowledgement timeout"
+                    );
                 }
                 self.wait(250)?;
             }
@@ -2404,6 +2425,16 @@ mod tests {
             true
         ));
         // Losing identity never permits critically low HP beside an enemy.
+        // Live V16 frame: Mavuika's HP arrived while Zhongli's old badge was
+        // still visible. During acknowledgement, that badge is not identity.
+        assert!(party_switch_health_safe(
+            None,
+            Some(3),
+            1.0,
+            mavuika_hp,
+            true
+        ));
+        assert!(!party_switch_health_safe(None, Some(3), 1.0, 0.30, true));
         assert!(!party_switch_health_safe(Some(3), None, 1.0, 0.30, true));
         assert!(!party_switch_health_safe(Some(3), Some(0), 1.0, 0.30, true));
         // A damaged member can still switch to safety at the verified statue.
