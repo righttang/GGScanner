@@ -1419,6 +1419,11 @@ mod windows {
                             )
                         });
                 }
+                // Keep the actual world minimap, since the failure screenshot
+                // below may show the pause menu instead of the failed match.
+                recovery_frame
+                    .save("data/mining/last-mini-map-recovery.png")
+                    .ok();
                 let recovered = recovered
                     .or_else(|_| self.mini.relocalize(&recovery_frame, Some(self.game.token)))?;
                 self.game.resume_world()?;

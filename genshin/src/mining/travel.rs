@@ -123,7 +123,9 @@ fn follow_inner(
             if flying
                 && observation.motion == Motion::Ground
                 && observation.grounded
-                && remaining < 8.0
+                // Real landings stopped around nine map units away. Allow
+                // a short, confirmed-ground approach without another takeoff.
+                && remaining < 12.0
             {
                 flight_finished = true;
             }
@@ -250,6 +252,8 @@ mod tests {
         fail: bool,
         direction_coupled_jitter: bool,
         ignore_turns: bool,
+        land_at: Option<u64>,
+        grounded_override: Option<bool>,
     }
     impl KeyDriver for Replay {
         fn key_down(&mut self, k: Key) -> Result<()> {
@@ -276,6 +280,9 @@ mod tests {
                 self.key_up(Key::Layout('w'))?;
             }
             ensure!(!self.fail, "capture failed");
+            if self.mode == Motion::Gliding && self.land_at.is_some_and(|at| self.now >= at) {
+                self.mode = Motion::Ground;
+            }
             let position = if self.direction_coupled_jitter {
                 // The actual A03 trace alternated these +/- 0.5 offsets as
                 // the viewing cone rotated across the mini-map terrain.
@@ -293,7 +300,9 @@ mod tests {
                 position,
                 heading: self.heading,
                 motion: self.mode,
-                grounded: self.mode == Motion::Ground,
+                grounded: self
+                    .grounded_override
+                    .unwrap_or(self.mode == Motion::Ground),
                 paused: pause,
             })
         }
@@ -331,6 +340,40 @@ mod tests {
             fail: false,
             direction_coupled_jitter: false,
             ignore_turns: false,
+            land_at: None,
+            grounded_override: None,
+        }
+    }
+    #[test]
+    fn real_short_glide_landings_finish_on_foot_without_another_takeoff() {
+        for (start, target) in [
+            ((4649.0, 2408.0), (4639.46, 2405.53)),
+            ((10270.0, -161.0), (10267.1, -151.31)),
+        ] {
+            let mut d = replay(Motion::Gliding);
+            d.p = start;
+            d.heading = (start.1 - target.1).atan2(start.0 - target.0);
+            d.land_at = Some(200);
+            let position = follow(&mut d, start, target, "fly").unwrap();
+            assert_eq!(d.mode, Motion::Ground);
+            assert!(distance(position, target) < 2.0);
+            assert!(d.now < 10_000);
+            assert!(!d.events.contains(&Key::Space));
+            assert!(d.held.is_empty());
+        }
+    }
+    #[test]
+    fn early_glide_landings_still_reject_distant_or_unconfirmed_ground() {
+        for (start, grounded) in [((40.0, 0.0), None), ((10.0, 0.0), Some(false))] {
+            let mut d = replay(Motion::Gliding);
+            d.p = start;
+            d.land_at = Some(1);
+            d.grounded_override = grounded;
+            let error = follow(&mut d, start, (0.0, 0.0), "fly").unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("Gliding ended before the waypoint"));
+            assert!(d.held.is_empty());
         }
     }
     #[test]
