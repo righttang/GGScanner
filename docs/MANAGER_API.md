@@ -61,10 +61,19 @@ Route teleport coordinates select a nearby known anchor; the runtime checks
 that anchor's canonical icon, menu and landing rather than treating the recorded
 sample as the exact spawn. `force_tp` also teleports when already near the anchor.
 Failures preserve one local `last-route-failure.png` and JSON with the latest
-64 navigation observations for diagnosis.
+64 navigation observations for diagnosis. `lastTeleport` records the requested
+anchor, latest map projection, icon click, and latest landing position or error;
+landing observations replace previous errors rather than accumulating copies.
+When a teleport selection panel was captured, failure also saves
+`last-teleport-selection.png` before recovery changes the location.
 Mini-map tracking uses local terrain templates. Layer manifests include caves;
-optional `info.floor` disambiguates overlapping floors. An ambiguous position or floor
-stops the route. `mapFloor` reports the most recently confirmed floor.
+optional `info.floor` disambiguates overlapping floors. `positions[].floor`
+overrides that default for the corresponding waypoint leg, including a teleport;
+an omitted leg hint returns to `info.floor` or automatic layer matching. This
+allows a known surface spawn to be constrained without pinning a later cave or
+underwater leg to the surface. Changing the constraint clears the old layer cache.
+An ambiguous position or floor stops the route. `mapFloor` reports the most
+recently confirmed floor.
 Near a waypoint, turning accounts for small position jitter while preserving
 the arrival distance check. Continuous stationary turns also run the bounded
 no-progress escape logic instead of waiting for the full waypoint timeout.

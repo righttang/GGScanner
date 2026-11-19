@@ -1380,7 +1380,7 @@ mod tests {
             .unwrap_or(0);
         let point = &route.positions[waypoint];
         let mut locator = MiniMapLocator::new().unwrap();
-        locator.set_floor(route.floor_hint());
+        locator.set_floor(route.waypoint_floor(waypoint));
         let position = locator.locate(
             &frame,
             (point.x, point.y),

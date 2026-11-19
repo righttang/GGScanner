@@ -24,6 +24,13 @@ pub(super) struct TeleportAnchor {
     neighbor_distance: f64,
 }
 impl TeleportAnchor {
+    pub fn diagnostic(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id, "kind": self.kind, "name": self.name,
+            "country": self.country, "areas": self.areas,
+            "mapPosition": self.map_position(), "landingPosition": self.landing_position(),
+        })
+    }
     pub fn correction_limit(&self, scale: f64) -> f64 {
         (self.neighbor_distance / (4.0 * scale) * 0.3).clamp(6.0, 36.0)
     }

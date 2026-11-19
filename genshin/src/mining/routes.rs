@@ -51,6 +51,9 @@ pub struct Waypoint {
     #[serde(rename = "type")]
     pub kind: String,
     pub move_mode: String,
+    /// Constrains this leg only; omitted legs return to the route-wide policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<i32>,
     #[serde(default)]
     pub action: String,
     #[serde(default)]
@@ -79,6 +82,9 @@ impl Waypoint {
 }
 
 impl Route {
+    pub fn waypoint_floor(&self, index: usize) -> Option<i32> {
+        self.positions[index].floor.or(self.floor_hint())
+    }
     pub fn floor_hint(&self) -> Option<i32> {
         // Ground describes the movement environment, not map elevation: a
         // walking route can enter a cave. Only explicit metadata pins a floor.
@@ -248,7 +254,7 @@ pub struct RouteEntry {
     pub last_run: Option<RouteValidation>,
 }
 
-pub const ENGINE_REVISION: &str = "mining-20261119-v11";
+pub const ENGINE_REVISION: &str = "mining-20261120-v12";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteValidation {
@@ -650,6 +656,7 @@ mod tests {
                     y: 2.0,
                     kind: "teleport".into(),
                     move_mode: "walk".into(),
+                    floor: None,
                     action: "".into(),
                     action_params: "".into(),
                 },
@@ -659,6 +666,7 @@ mod tests {
                     y: 3.0,
                     kind: kind.into(),
                     move_mode: "walk".into(),
+                    floor: None,
                     action: action.into(),
                     action_params: params.into(),
                 },
@@ -688,6 +696,21 @@ mod tests {
                 .unwrap(),
             (3, 3)
         );
+    }
+    #[test]
+    fn surface_spawn_hint_does_not_pin_later_cave_legs() {
+        let mut route = route("path", "mining", "");
+        route.positions[0].floor = Some(0);
+        let round_trip = Route::parse(&serde_json::to_vec(&route).unwrap()).unwrap();
+        assert_eq!(round_trip.waypoint_floor(0), Some(0));
+        assert_eq!(round_trip.waypoint_floor(1), None);
+        assert!(round_trip.issues().is_empty());
+
+        route.info.floor = Some(-1);
+        assert_eq!(route.waypoint_floor(0), Some(0));
+        assert_eq!(route.waypoint_floor(1), Some(-1));
+        let json = serde_json::to_value(&route).unwrap();
+        assert!(json["positions"][1].get("floor").is_none());
     }
     #[test]
     fn route_ids_cannot_escape_store() {

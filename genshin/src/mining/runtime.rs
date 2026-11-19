@@ -216,6 +216,8 @@ mod windows {
         camera_probes: u64,
         has_mavuika: Option<bool>,
         navigation_trace: std::collections::VecDeque<serde_json::Value>,
+        teleport_diagnostic: serde_json::Value,
+        teleport_selection: Option<RgbImage>,
     }
     impl KeyDriver for Game<'_> {
         fn key_down(&mut self, key: Key) -> Result<()> {
@@ -788,6 +790,8 @@ mod windows {
             camera_probes: 0,
             has_mavuika: None,
             navigation_trace: Default::default(),
+            teleport_diagnostic: serde_json::Value::Null,
+            teleport_selection: None,
         };
         game.check()?;
         if !game.ctrl.return_to_main_ui(3) {
@@ -851,7 +855,10 @@ mod windows {
         for (route, route_id) in routes.into_iter().zip(&request.route_ids) {
             report.route = route.info.name.clone();
             game.navigation_trace.clear();
+            game.teleport_diagnostic = serde_json::Value::Null;
+            game.teleport_selection = None;
             mini_locator.set_floor(route.floor_hint());
+            let mut requested_floor = route.floor_hint();
             let completed_before = report.completed_points;
             let loot_before = report.loot.clone();
             let result = (|| -> Result<()> {
@@ -862,6 +869,11 @@ mod windows {
                 for (index, point) in route.positions.iter().enumerate() {
                     game.check()?;
                     report.waypoint = index + 1;
+                    let waypoint_floor = route.waypoint_floor(index);
+                    if waypoint_floor != requested_floor {
+                        mini_locator.set_floor(waypoint_floor);
+                        requested_floor = waypoint_floor;
+                    }
                     if point.kind != "teleport"
                         && point.action != "fight"
                         && !game.underwater_route
@@ -1076,11 +1088,15 @@ mod windows {
                 if let Ok(frame) = game.frame() {
                     frame.save("data/mining/last-route-failure.png").ok();
                 }
+                if let Some(frame) = &game.teleport_selection {
+                    frame.save("data/mining/last-teleport-selection.png").ok();
+                }
                 if let Ok(bytes) = serde_json::to_vec_pretty(&serde_json::json!({
                     "engineRevision":super::super::routes::ENGINE_REVISION,
                     "route":report.route,"waypoint":report.waypoint,
                     "error":result.as_ref().err().map(|error| format!("{error:#}")),
                     "lastNavigation":game.navigation_trace,
+                    "lastTeleport":game.teleport_diagnostic,
                 })) {
                     let _ = super::super::routes::write_cache(
                         std::path::Path::new("data/mining/last-route-failure.json"),
@@ -1524,6 +1540,11 @@ mod windows {
         force: bool,
     ) -> Result<()> {
         use super::super::big_map::Projection;
+        game.teleport_diagnostic = serde_json::json!({
+            "anchor": anchor.diagnostic(), "target": target, "force": force,
+            "phase": "preparing", "hasSelectionFrame": false,
+        });
+        game.teleport_selection = None;
         game.camera_calibration = None;
         let map_target = anchor.map_position();
         ensure!(
@@ -1539,6 +1560,7 @@ mod windows {
                 && (position.0 - landing.0).hypot(position.1 - landing.1) < 12.0
                 && (position.0 - target.0).hypot(position.1 - target.1) < 16.0
             {
+                game.teleport_diagnostic["phase"] = "alreadyNearAnchor".into();
                 return Ok(());
             }
         }
@@ -1640,6 +1662,10 @@ mod windows {
             let (x, y) = projection.center;
             let scale = projection.scale;
             let (screen_x, screen_y) = projection.screen(map_target);
+            game.teleport_diagnostic["phase"] = "mapNavigation".into();
+            game.teleport_diagnostic["projection"] = serde_json::json!({
+                "center": [x,y], "scale": scale, "screen": [screen_x,screen_y],
+            });
             pan_trace.push(serde_json::json!({"center":[x,y],"scale":scale,"target":map_target,"screen":[screen_x,screen_y]}));
             if cfg!(debug_assertions) {
                 let _ = super::super::routes::write_cache(
@@ -1667,6 +1693,7 @@ mod windows {
                             continue;
                         },
                     };
+                game.teleport_diagnostic["iconClick"] = serde_json::json!(point);
                 game.click(point.0, point.1)?;
                 game.wait(600)?;
                 let mut panel = game.frame()?;
@@ -1684,22 +1711,41 @@ mod windows {
                         }
                     }
                 }
+                game.teleport_diagnostic["buttonText"] = label.clone().into();
+                game.teleport_diagnostic["hasSelectionFrame"] = true.into();
+                game.teleport_selection = Some(panel);
                 ensure!(
                     label.contains("传送"),
                     "Teleport button absent; anchor may be locked or obscured"
                 );
                 game.click(1710.0, 1010.0)?;
+                game.teleport_diagnostic["phase"] = "landing".into();
                 game.wait(1500)?;
-                for _ in 0..60 {
-                    if let Ok(landed) =
-                        locate(game, mini_locator, Some(anchor.landing_position()), 50)
-                    {
-                        let landing = anchor.landing_position();
-                        if (landed.0 - target.0).hypot(landed.1 - target.1) <= 40.0
-                            && (landed.0 - landing.0).hypot(landed.1 - landing.1) <= 16.0
-                        {
-                            return Ok(());
-                        }
+                for observation in 1..=60 {
+                    game.teleport_diagnostic["landingObservations"] = observation.into();
+                    match locate(game, mini_locator, Some(anchor.landing_position()), 50) {
+                        Ok(landed) => {
+                            let landing = anchor.landing_position();
+                            game.teleport_diagnostic["lastLandingError"] = serde_json::Value::Null;
+                            game.teleport_diagnostic["lastLanding"] = serde_json::json!({
+                                "position": landed, "floor": mini_locator.last_floor,
+                                "anchorDistance": (landed.0-landing.0).hypot(landed.1-landing.1),
+                                "targetDistance": (landed.0-target.0).hypot(landed.1-target.1),
+                            });
+                            if (landed.0 - target.0).hypot(landed.1 - target.1) <= 40.0
+                                && (landed.0 - landing.0).hypot(landed.1 - landing.1) <= 16.0
+                            {
+                                game.teleport_diagnostic["phase"] = "confirmed".into();
+                                return Ok(());
+                            }
+                        },
+                        Err(error) => {
+                            // Retain only the latest error, not sixty copies of
+                            // a potentially large layered-map diagnostic.
+                            game.teleport_diagnostic["lastLandingError"] =
+                                format!("{error:#}").into();
+                            game.teleport_diagnostic["lastLanding"] = serde_json::Value::Null;
+                        },
                     }
                     game.wait(500)?;
                 }
