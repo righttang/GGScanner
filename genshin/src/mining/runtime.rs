@@ -1387,15 +1387,39 @@ mod windows {
                 // Match the captured world image while Paimon's menu pauses
                 // combat. Expanded/global searches must not leave an idle
                 // character exposed for the duration of asset loading.
-                let recovery_frame = self.game.frame()?;
+                self.game.wait(150)?;
+                let mut recovery_frame = self.game.frame()?;
+                super::super::vision::check_mining_health(&recovery_frame)?;
                 self.game.pause_world()?;
-                let recovered = self
+                let mut recovered = self
                     .mini
                     .locate(&recovery_frame, expected, 60.0, Some(self.game.token))
                     .or_else(|_| {
                         self.mini
                             .locate(&recovery_frame, expected, 250.0, Some(self.game.token))
-                    })
+                    });
+                if recovered.is_err() {
+                    // Terrain and marker animations can spoil one minimap
+                    // snapshot. Try one fresh, stationary world frame before
+                    // searching globally, with the same match thresholds.
+                    self.game.resume_world()?;
+                    self.game.wait(150)?;
+                    recovery_frame = self.game.frame()?;
+                    super::super::vision::check_mining_health(&recovery_frame)?;
+                    self.game.pause_world()?;
+                    recovered = self
+                        .mini
+                        .locate(&recovery_frame, expected, 60.0, Some(self.game.token))
+                        .or_else(|_| {
+                            self.mini.locate(
+                                &recovery_frame,
+                                expected,
+                                250.0,
+                                Some(self.game.token),
+                            )
+                        });
+                }
+                let recovered = recovered
                     .or_else(|_| self.mini.relocalize(&recovery_frame, Some(self.game.token)))?;
                 self.game.resume_world()?;
                 self.game.wait(100)?;
