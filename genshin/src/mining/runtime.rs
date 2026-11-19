@@ -469,14 +469,7 @@ mod windows {
 
         fn ore_frame(&mut self) -> Result<RgbImage> {
             let before = self.frame()?;
-            ensure!(
-                super::super::vision::player_health_fraction(&before).is_some_and(|hp| hp >= 0.45),
-                "Health too low or unconfirmed for ore aiming"
-            );
-            ensure!(
-                !super::super::vision::enemy_health_bar(&before),
-                "Enemy approached during ore aiming"
-            );
+            super::super::vision::check_ore_aim_safety(&before)?;
             if self
                 .sight_refreshed
                 .is_none_or(|time| time.elapsed() >= Duration::from_millis(2500))
@@ -488,6 +481,7 @@ mod windows {
                 self.wait(1500)?;
             }
             let frame = self.frame()?;
+            super::super::vision::check_ore_aim_safety(&frame)?;
             ensure!(
                 super::super::vision::aiming_active(&frame),
                 "Aiming mode was interrupted"
@@ -2104,6 +2098,9 @@ mod windows {
         let attribute_to_previous = report.phase == "moving";
         for _ in 0..12 {
             let frame = game.frame()?;
+            // Movement pickups can precede the caller's combat pass, so only
+            // enforce health here; do not skip that combat by rejecting enemies.
+            super::super::vision::check_mining_health(&frame)?;
             if game.record_loot(&frame, report)? && attribute_to_previous {
                 if let Some(last) = report.points.last_mut() {
                     if last.route == report.route
@@ -2153,6 +2150,13 @@ mod windows {
         let mut last_gain = None;
         while Instant::now() < deadline {
             game.wait(200)?;
+            let frame = game.frame()?;
+            if game.underwater_route {
+                // Crab skills can mine while underwater enemies are nearby.
+                super::super::vision::check_mining_health(&frame)?;
+            } else {
+                super::super::vision::check_ore_aim_safety(&frame)?;
+            }
             let before = report.loot.values().sum::<usize>();
             // Break/charge animations can delay the F prompt beyond the
             // initial pickup pass. Continue observing it while loot settles;
@@ -2282,7 +2286,9 @@ mod windows {
         ensure!(
             observe_stable_state(true, || {
                 game.wait(100)?;
-                Ok(super::super::vision::aiming_active(&game.frame()?))
+                let frame = game.frame()?;
+                super::super::vision::check_ore_aim_safety(&frame)?;
+                Ok(super::super::vision::aiming_active(&frame))
             })?,
             "Could not enter aiming mode"
         );

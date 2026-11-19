@@ -49,6 +49,23 @@ pub(super) fn aiming_active(frame: &RgbImage) -> bool {
     white >= 450 && dark >= 40 && white + dark >= 650
 }
 
+pub(super) fn check_mining_health(frame: &RgbImage) -> Result<()> {
+    ensure!(
+        player_health_fraction(frame).is_some_and(|hp| hp >= 0.45),
+        "Health too low or unconfirmed for mining"
+    );
+    Ok(())
+}
+
+pub(super) fn check_ore_aim_safety(frame: &RgbImage) -> Result<()> {
+    check_mining_health(frame)?;
+    ensure!(
+        !enemy_health_bar(frame),
+        "Enemy approached during ore aiming"
+    );
+    Ok(())
+}
+
 /// Long, thin red bars in the scene; excludes the player HUD at the bottom.
 pub(super) fn enemy_health_bar(frame: &RgbImage) -> bool {
     // Enemy HP fills are flat pink UI rectangles. Fire and Mavuika's ring can
@@ -1159,6 +1176,12 @@ mod tests {
             aiming_active(&frame),
             std::env::var("GGSCANNER_EXPECT_AIMING").unwrap() == "true"
         );
+        if let Ok(expected) = std::env::var("GGSCANNER_EXPECT_AIMING_SAFE") {
+            assert_eq!(check_ore_aim_safety(&frame).is_ok(), expected == "true");
+        }
+        if let Ok(expected) = std::env::var("GGSCANNER_EXPECT_MINING_HEALTH") {
+            assert_eq!(check_mining_health(&frame).is_ok(), expected == "true");
+        }
     }
     #[test]
     fn bright_terrain_does_not_enter_or_toggle_aiming_state() {
