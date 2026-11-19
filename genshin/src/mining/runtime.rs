@@ -131,6 +131,20 @@ fn observe_stable_state(expected: bool, mut sample: impl FnMut() -> Result<bool>
     Ok(false)
 }
 
+#[cfg(any(windows, test))]
+fn party_switch_health_safe(
+    previous_slot: Option<usize>,
+    observed_slot: Option<usize>,
+    initial_hp: f64,
+    hp: f64,
+    enemy: bool,
+) -> bool {
+    // Percentages belong to a character, not the whole party. A switch fade
+    // can expose the new HP bar before its active-slot badge is recognizable.
+    (previous_slot.is_none() || observed_slot != previous_slot || hp >= initial_hp - 0.15)
+        && (!enemy || hp >= 0.45)
+}
+
 pub(super) struct MovementProgress {
     anchor: (f64, f64),
     unchanged: usize,
@@ -499,6 +513,7 @@ mod windows {
                     slot + 1
                 );
                 let initial_hp = super::super::vision::player_health_fraction(&before).unwrap();
+                let previous_slot = super::super::vision::active_party_slot(&before);
                 self.key(Key::Layout(char::from(b'1' + slot as u8)))?;
                 // Poll acknowledgement instead of standing exposed for the
                 // full shared switch CD after every successful change.
@@ -507,7 +522,8 @@ mod windows {
                 while Instant::now() < deadline {
                     self.wait(100)?;
                     let after = self.frame()?;
-                    if super::super::vision::active_party_slot(&after) == Some(slot) {
+                    let observed_slot = super::super::vision::active_party_slot(&after);
+                    if observed_slot == Some(slot) {
                         if confirmed {
                             self.selected_slot = Some(slot);
                             return Ok(());
@@ -521,8 +537,13 @@ mod windows {
                     // key. The next attempt repeats the living-target preflight.
                     if let Some(hp) = super::super::vision::player_health_fraction(&after) {
                         ensure!(
-                            hp >= initial_hp - 0.15
-                                && (!super::super::vision::enemy_health_bar(&after) || hp >= 0.45),
+                            party_switch_health_safe(
+                                previous_slot,
+                                observed_slot,
+                                initial_hp,
+                                hp,
+                                super::super::vision::enemy_health_bar(&after),
+                            ),
                             "Health fell while party switching was blocked"
                         );
                     }
@@ -2356,6 +2377,38 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn switch_health_compares_only_the_same_confirmed_member() {
+        // Actual failure: full-HP Zhongli -> 12036/20055 Mavuika, with the
+        // new member's keycap still hidden by the switch animation.
+        let mavuika_hp = 12036.0 / 20055.0;
+        assert!(party_switch_health_safe(
+            Some(3),
+            None,
+            1.0,
+            mavuika_hp,
+            true
+        ));
+        assert!(party_switch_health_safe(
+            Some(3),
+            Some(0),
+            1.0,
+            mavuika_hp,
+            true
+        ));
+        assert!(!party_switch_health_safe(
+            Some(3),
+            Some(3),
+            1.0,
+            mavuika_hp,
+            true
+        ));
+        // Losing identity never permits critically low HP beside an enemy.
+        assert!(!party_switch_health_safe(Some(3), None, 1.0, 0.30, true));
+        assert!(!party_switch_health_safe(Some(3), Some(0), 1.0, 0.30, true));
+        // A damaged member can still switch to safety at the verified statue.
+        assert!(party_switch_health_safe(Some(0), None, 0.30, 0.30, false));
+    }
     #[test]
     fn delayed_menu_transition_waits_for_a_stable_world_hud() {
         // The D07 failure checked at 200ms, before the menu animation ended.
