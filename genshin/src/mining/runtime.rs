@@ -107,22 +107,28 @@ pub type MiningProgress<'a> = dyn Fn(&MiningReport) + 'a;
 /// Samples include a bounded wait in the live driver. Never send another menu
 /// toggle while the previous transition is still settling.
 #[cfg(any(windows, test))]
-fn confirm_world_state(
-    expected_world: bool,
-    mut sample: impl FnMut() -> Result<bool>,
-) -> Result<()> {
+fn confirm_world_state(expected_world: bool, sample: impl FnMut() -> Result<bool>) -> Result<()> {
+    anyhow::ensure!(
+        observe_stable_state(expected_world, sample)?,
+        "World UI transition did not settle"
+    );
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn observe_stable_state(expected: bool, mut sample: impl FnMut() -> Result<bool>) -> Result<bool> {
     let mut stable = 0;
     for _ in 0..25 {
-        if sample()? == expected_world {
+        if sample()? == expected {
             stable += 1;
             if stable == 2 {
-                return Ok(());
+                return Ok(true);
             }
         } else {
             stable = 0;
         }
     }
-    anyhow::bail!("World UI transition did not settle")
+    Ok(false)
 }
 
 pub(super) struct MovementProgress {
@@ -371,14 +377,17 @@ mod windows {
         }
         fn motion(&self) -> Result<Motion> {
             let frame = self.frame()?;
+            self.motion_from_frame(&frame)
+        }
+        fn motion_from_frame(&self, frame: &RgbImage) -> Result<Motion> {
             // Read keycaps separately; a wide crop merges Ctrl, Space and the
             // scene/UID into an unreliable line of text.
             let labels = format!(
                 "{} {}",
-                self.read(&frame, 1560, 1024, 100, 34)?,
-                self.read(&frame, 1660, 1024, 100, 34)?
+                self.read(frame, 1560, 1024, 100, 34)?,
+                self.read(frame, 1660, 1024, 100, 34)?
             );
-            Ok(self.motion.observe(&frame, &labels))
+            Ok(self.motion.observe(frame, &labels))
         }
         fn click(&mut self, x: f64, y: f64) -> Result<()> {
             self.check()?;
@@ -461,6 +470,9 @@ mod windows {
         }
         fn select_slot(&mut self, slot: usize) -> Result<()> {
             ensure!(slot < 4, "Party slot is outside the active party");
+            // A direct slot change (including recovery health checks) invalidates
+            // the cached role until select_role confirms its name again.
+            self.selected_role = None;
             let before = self.frame()?;
             if super::super::vision::active_party_slot(&before) == Some(slot) {
                 self.selected_slot = Some(slot);
@@ -643,10 +655,19 @@ mod windows {
         }
         fn check_underwater_skill(&mut self) -> Result<()> {
             if self.underwater_route {
+                // Ctrl release can precede the diving animation's E footer.
+                // Observe readiness without issuing another movement or skill.
+                let ready = observe_stable_state(true, || {
+                    self.wait(100)?;
+                    let frame = self.frame()?;
+                    Ok(self.motion_from_frame(&frame)? == Motion::Underwater
+                        && self.motion.borrowed_skill_present(&frame))
+                })?;
                 ensure!(
                     self.motion()? == Motion::Underwater,
                     "Underwater skill requires a confirmed underwater HUD"
                 );
+                ensure!(ready, "No borrowed underwater E skill is visible");
                 self.wait_skill(Role::Dehya)?;
                 ensure!(
                     self.motion.borrowed_skill_present(&self.frame()?),
@@ -1356,12 +1377,7 @@ mod windows {
             };
             paused |= probes_before != self.game.camera_probes;
             self.sensitivity = sensitivity;
-            let labels = format!(
-                "{} {}",
-                self.game.read(&frame, 1560, 1024, 100, 34)?,
-                self.game.read(&frame, 1660, 1024, 100, 34)?
-            );
-            let motion = self.game.motion.observe(&frame, &labels);
+            let motion = self.game.motion_from_frame(&frame)?;
             if began.elapsed() > Duration::from_millis(250) || paused {
                 self.game.key_up(Key::Layout('w'))?;
                 self.game.key_up(Key::Shift)?;
@@ -1506,6 +1522,28 @@ mod windows {
             game.ctrl.return_to_main_ui(3),
             "Recovery cannot resume the world"
         );
+        // The first incomplete health check can leave a low-HP member active.
+        // Keep the normal movement guard: choose a visibly living, healthy
+        // member at the verified statue landing before approaching the statue.
+        let mut healthy_mover = false;
+        for slot in 0..4 {
+            if !super::super::vision::party_slot_available(&game.frame()?, slot) {
+                continue;
+            }
+            game.select_slot(slot)?;
+            game.wait(500)?;
+            let frame = game.frame()?;
+            if super::super::vision::active_party_slot(&frame) == Some(slot)
+                && super::super::vision::player_health_fraction(&frame).is_some_and(|hp| hp >= 0.60)
+            {
+                healthy_mover = true;
+                break;
+            }
+        }
+        ensure!(
+            healthy_mover,
+            "No confirmed healthy member for statue approach"
+        );
         let position = locate(game, mini, Some(statue.landing_position()), 30)?;
         move_to_current(game, mini, position, statue.map_position(), "walk", None)?;
         land(game, "", progress, report)?;
@@ -1528,9 +1566,18 @@ mod windows {
     fn party_restored(game: &mut Game<'_>) -> Result<bool> {
         for slot in 0..4 {
             game.select_slot(slot)?;
-            if !super::super::vision::player_health_fraction(&game.frame()?)
-                .is_some_and(|hp| hp >= 0.97)
-            {
+            // Slot acknowledgement can arrive while the old HP bar is fading.
+            // Wait for the selected member, then require two fresh full bars.
+            game.wait(500)?;
+            if !observe_stable_state(true, || {
+                game.wait(100)?;
+                let frame = game.frame()?;
+                Ok(
+                    super::super::vision::active_party_slot(&frame) == Some(slot)
+                        && super::super::vision::player_health_fraction(&frame)
+                            .is_some_and(|hp| hp >= 0.97),
+                )
+            })? {
                 return Ok(false);
             }
         }
