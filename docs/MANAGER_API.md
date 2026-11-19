@@ -57,6 +57,9 @@ The big map requires agreeing SIFT features and a north-up geometric transform.
 Region labels are located across overlapping rows to accommodate extra menu
 header messages. Start a route from the world view; after a failed task, inspect
 and close any remaining menus before retrying.
+Navigation's pause/resume transitions wait for two agreeing UI observations with
+a bounded polling window. Each transition sends one menu toggle; a slow animation
+is observed without sending further toggles, and cancellation or lost focus stops it.
 Route teleport coordinates select a nearby known anchor; the runtime checks
 that anchor's canonical icon, menu and landing rather than treating the recorded
 sample as the exact spawn. `force_tp` also teleports when already near the anchor.

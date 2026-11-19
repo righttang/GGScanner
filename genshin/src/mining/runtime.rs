@@ -104,6 +104,27 @@ pub struct MiningPointResult {
 
 pub type MiningProgress<'a> = dyn Fn(&MiningReport) + 'a;
 
+/// Samples include a bounded wait in the live driver. Never send another menu
+/// toggle while the previous transition is still settling.
+#[cfg(any(windows, test))]
+fn confirm_world_state(
+    expected_world: bool,
+    mut sample: impl FnMut() -> Result<bool>,
+) -> Result<()> {
+    let mut stable = 0;
+    for _ in 0..25 {
+        if sample()? == expected_world {
+            stable += 1;
+            if stable == 2 {
+                return Ok(());
+            }
+        } else {
+            stable = 0;
+        }
+    }
+    anyhow::bail!("World UI transition did not settle")
+}
+
 pub(super) struct MovementProgress {
     anchor: (f64, f64),
     unchanged: usize,
@@ -315,9 +336,12 @@ mod windows {
                 "Main world is unavailable for pausing"
             );
             self.key(Key::Escape)?;
-            self.wait(200)?;
-            ensure!(!self.ctrl.is_likely_main_world(), "Pause menu did not open");
-            Ok(())
+            self.wait(300)?;
+            confirm_world_state(false, || {
+                self.wait(100)?;
+                Ok(self.ctrl.is_likely_main_world())
+            })
+            .context("Pause menu did not open")
         }
         fn resume_world(&mut self) -> Result<()> {
             self.check()?;
@@ -325,12 +349,12 @@ mod windows {
                 return Ok(());
             }
             self.key(Key::Escape)?;
-            self.wait(200)?;
-            ensure!(
-                self.ctrl.is_likely_main_world(),
-                "Pause menu did not return to the world"
-            );
-            Ok(())
+            self.wait(300)?;
+            confirm_world_state(true, || {
+                self.wait(100)?;
+                Ok(self.ctrl.is_likely_main_world())
+            })
+            .context("Pause menu did not return to the world")
         }
         fn frame(&self) -> Result<RgbImage> {
             self.check()?;
@@ -2263,6 +2287,38 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delayed_menu_transition_waits_for_a_stable_world_hud() {
+        // The D07 failure checked at 200ms, before the menu animation ended.
+        // A transient HUD frame during that animation is not an acknowledgement.
+        let states = [false, false, false, false, false, true, false, true, true];
+        let mut samples = 0;
+        confirm_world_state(true, || {
+            let world = states[samples];
+            samples += 1;
+            Ok(world)
+        })
+        .unwrap();
+        assert_eq!(samples, states.len());
+    }
+    #[test]
+    fn menu_transition_timeout_and_cancellation_do_not_retry_input() {
+        let mut samples = 0;
+        assert!(confirm_world_state(true, || {
+            samples += 1;
+            Ok(false)
+        })
+        .is_err());
+        assert_eq!(samples, 25);
+        let mut samples = 0;
+        let error = confirm_world_state(false, || {
+            samples += 1;
+            anyhow::bail!("Game window lost focus")
+        })
+        .unwrap_err();
+        assert_eq!(samples, 1);
+        assert!(error.to_string().contains("lost focus"));
+    }
     #[test]
     fn small_forward_steps_accumulate_before_stuck_detection() {
         let mut moving = MovementProgress::new((0.0, 0.0), (100.0, 0.0));
